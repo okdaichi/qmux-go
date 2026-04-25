@@ -12,7 +12,7 @@ At a high level, qmux is an approach to multiplexing streams over an underlying 
 
 ## Project status (scaffold only)
 
-This repository currently provides only a compile-able project skeleton.
+This repository currently provides only a compilable project skeleton.
 
 ## Goals
 
