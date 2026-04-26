@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/okdaichi/qmux-go/qmux/internal/wire"
@@ -16,19 +17,27 @@ type receiveSide struct {
 	readBuffer    bytes.Buffer
 	readChan      chan struct{}
 	receiveFC     *flowController
-	receiveOffset uint64
-	receiveClosed bool
+	receiveOffset atomic.Uint64
+	receiveClosed atomic.Bool
 	receiveError  error
 	readDeadline  time.Time
 }
 
+func (r *receiveSide) isClosed() bool {
+	return r.receiveClosed.Load()
+}
+
 type sendSide struct {
-	sendOffset    uint64
-	sendClosed    bool
+	sendOffset    atomic.Uint64
+	sendClosed    atomic.Bool
 	sendError     error
 	sendFC        *flowController
 	writeChan     chan struct{}
 	writeDeadline time.Time
+}
+
+func (s *sendSide) isClosed() bool {
+	return s.sendClosed.Load()
 }
 
 type baseStream struct {
@@ -128,7 +137,7 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 // Internal methods on baseStream
 func (s *baseStream) read(p []byte) (n int, err error) {
 	s.mutex.Lock()
-	for s.receive.readBuffer.Len() == 0 && !s.receive.receiveClosed && s.receive.receiveError == nil {
+	for s.receive.readBuffer.Len() == 0 && !s.receive.receiveClosed.Load() && s.receive.receiveError == nil {
 		if !s.receive.readDeadline.IsZero() && time.Now().After(s.receive.readDeadline) {
 			s.mutex.Unlock()
 			return 0, errors.New("deadline exceeded")
@@ -184,7 +193,7 @@ func (s *baseStream) read(p []byte) (n int, err error) {
 
 	if s.receive.receiveError != nil {
 		err = s.receive.receiveError
-	} else if s.receive.receiveClosed {
+	} else if s.receive.receiveClosed.Load() {
 		err = io.EOF
 	}
 	s.mutex.Unlock()
@@ -195,7 +204,7 @@ func (s *baseStream) write(p []byte) (n int, err error) {
 	total := 0
 	for total < len(p) {
 		s.mutex.Lock()
-		if s.send.sendClosed {
+		if s.send.sendClosed.Load() {
 			if s.send.sendError != nil {
 				err = s.send.sendError
 			} else {
@@ -274,7 +283,7 @@ func (s *baseStream) write(p []byte) (n int, err error) {
 
 		f := &wire.StreamFrame{
 			StreamID: uint64(s.id),
-			Offset:   s.send.sendOffset,
+			Offset:   s.send.sendOffset.Load(),
 			Data:     data,
 		}
 
@@ -282,11 +291,9 @@ func (s *baseStream) write(p []byte) (n int, err error) {
 			return total, err
 		}
 
-		s.mutex.Lock()
 		s.send.sendFC.AddSentBytes(uint64(len(data)))
 		s.session.connFC.AddSentBytes(uint64(len(data)))
-		s.send.sendOffset += uint64(len(data))
-		s.mutex.Unlock()
+		s.send.sendOffset.Add(uint64(len(data)))
 
 		total += len(data)
 	}
@@ -294,14 +301,37 @@ func (s *baseStream) write(p []byte) (n int, err error) {
 	return total, nil
 }
 
+func (s *baseStream) closeWithError(err error) {
+	// Close receive side
+	if !s.receive.receiveClosed.Swap(true) {
+		s.mutex.Lock()
+		s.receive.receiveError = err
+		s.mutex.Unlock()
+		select {
+		case s.receive.readChan <- struct{}{}:
+		default:
+		}
+	}
+
+	// Close send side
+	if !s.send.sendClosed.Swap(true) {
+		s.mutex.Lock()
+		s.send.sendError = err
+		s.mutex.Unlock()
+		select {
+		case s.send.writeChan <- struct{}{}:
+		default:
+		}
+	}
+}
+
 func (s *baseStream) close() error {
 	s.mutex.Lock()
-	if s.send.sendClosed {
+	if s.send.sendClosed.Swap(true) {
 		s.mutex.Unlock()
 		return nil
 	}
-	s.send.sendClosed = true
-	offset := s.send.sendOffset
+	offset := s.send.sendOffset.Load()
 	s.mutex.Unlock()
 
 	return s.session.sendFrame(&wire.StreamFrame{
@@ -319,9 +349,7 @@ func (s *baseStream) cancelRead(code quic.StreamErrorCode) {
 }
 
 func (s *baseStream) cancelWrite(code quic.StreamErrorCode) {
-	s.mutex.Lock()
-	offset := s.send.sendOffset
-	s.mutex.Unlock()
+	offset := s.send.sendOffset.Load()
 
 	s.session.queueControlFrame(&wire.ResetStreamFrame{
 		StreamID:  uint64(s.id),
@@ -334,7 +362,7 @@ func (s *baseStream) handleStreamFrame(f *wire.StreamFrame) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if f.Offset != s.receive.receiveOffset {
+	if f.Offset != s.receive.receiveOffset.Load() {
 		return &Error{ErrorCode: ProtocolViolationError, Message: "out of order STREAM frame"}
 	}
 
@@ -346,9 +374,9 @@ func (s *baseStream) handleStreamFrame(f *wire.StreamFrame) error {
 	}
 
 	s.receive.readBuffer.Write(f.Data)
-	s.receive.receiveOffset += uint64(len(f.Data))
+	s.receive.receiveOffset.Add(uint64(len(f.Data)))
 	if f.Fin {
-		s.receive.receiveClosed = true
+		s.receive.receiveClosed.Store(true)
 	}
 
 	select {
@@ -363,10 +391,9 @@ func (s *baseStream) handleResetStreamFrame(f *wire.ResetStreamFrame) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if s.receive.receiveClosed {
+	if s.receive.receiveClosed.Swap(true) {
 		return
 	}
-	s.receive.receiveClosed = true
 	s.receive.receiveError = &quic.StreamError{StreamID: s.id, ErrorCode: quic.StreamErrorCode(f.ErrorCode)}
 
 	// Unblock Read
@@ -383,13 +410,12 @@ func (s *baseStream) handleResetStreamFrame(f *wire.ResetStreamFrame) {
 
 func (s *baseStream) handleStopSendingFrame(f *wire.StopSendingFrame) {
 	s.mutex.Lock()
-	if s.send.sendClosed {
+	if s.send.sendClosed.Swap(true) {
 		s.mutex.Unlock()
 		return
 	}
-	s.send.sendClosed = true
 	s.send.sendError = &quic.StreamError{StreamID: s.id, ErrorCode: quic.StreamErrorCode(f.ErrorCode)}
-	offset := s.send.sendOffset
+	offset := s.send.sendOffset.Load()
 	s.mutex.Unlock()
 
 	// Send RESET_STREAM in response to STOP_SENDING as per RFC 9000

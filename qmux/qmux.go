@@ -42,6 +42,8 @@ type Config struct {
 	EnableDatagrams bool
 	// MaxDatagramFrameSize is the maximum size of a DATAGRAM frame.
 	MaxDatagramFrameSize uint64
+	// ApplicationProtocols is a list of supported application protocols (similar to ALPN).
+	ApplicationProtocols []string
 }
 
 // DefaultConfig returns the default configuration.

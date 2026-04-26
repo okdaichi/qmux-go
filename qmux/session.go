@@ -3,9 +3,11 @@ package qmux
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/okdaichi/qmux-go/qmux/internal/wire"
@@ -26,14 +28,14 @@ type streamManager struct {
 	mutex   sync.Mutex
 	streams map[StreamID]*baseStream
 
-	nextBidiStreamID StreamID
-	nextUniStreamID  StreamID
+	nextBidiStreamID atomic.Uint64
+	nextUniStreamID  atomic.Uint64
 
 	// Peer stream limits
-	peerMaxBidiStreams uint64
-	peerMaxUniStreams  uint64
-	openedBidiStreams  uint64
-	openedUniStreams   uint64
+	peerMaxBidiStreams atomic.Uint64
+	peerMaxUniStreams  atomic.Uint64
+	openedBidiStreams  atomic.Uint64
+	openedUniStreams   atomic.Uint64
 	streamLimitWake    chan struct{}
 
 	incomingBidi chan *Stream
@@ -42,28 +44,57 @@ type streamManager struct {
 
 func newStreamManager(config *Config, isServer bool) *streamManager {
 	sm := &streamManager{
-		streams:            make(map[StreamID]*baseStream),
-		incomingBidi:       make(chan *Stream, int(config.MaxIncomingStreams)),
-		incomingUni:        make(chan *ReceiveStream, int(config.MaxIncomingUniStreams)),
-		streamLimitWake:    make(chan struct{}),
-		peerMaxBidiStreams: 100, // Initial default
-		peerMaxUniStreams:  100,
+		streams:         make(map[StreamID]*baseStream),
+		incomingBidi:    make(chan *Stream, int(config.MaxIncomingStreams)),
+		incomingUni:     make(chan *ReceiveStream, int(config.MaxIncomingUniStreams)),
+		streamLimitWake: make(chan struct{}),
 	}
+	sm.peerMaxBidiStreams.Store(100) // Initial default
+	sm.peerMaxUniStreams.Store(100)
 
 	if isServer {
-		sm.nextBidiStreamID = StreamID(streamIDServerInitiated | streamIDBidirectional)
-		sm.nextUniStreamID = StreamID(streamIDServerInitiated | streamIDUnidirectional)
+		sm.nextBidiStreamID.Store(uint64(streamIDServerInitiated | streamIDBidirectional))
+		sm.nextUniStreamID.Store(uint64(streamIDServerInitiated | streamIDUnidirectional))
 	} else {
-		sm.nextBidiStreamID = StreamID(streamIDClientInitiated | streamIDBidirectional)
-		sm.nextUniStreamID = StreamID(streamIDClientInitiated | streamIDUnidirectional)
+		sm.nextBidiStreamID.Store(uint64(streamIDClientInitiated | streamIDBidirectional))
+		sm.nextUniStreamID.Store(uint64(streamIDClientInitiated | streamIDUnidirectional))
 	}
 	return sm
+}
+
+type byteCountingConn struct {
+	net.Conn
+	bytesSent     *atomic.Uint64
+	bytesReceived *atomic.Uint64
+}
+
+func (c *byteCountingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.bytesReceived.Add(uint64(n))
+	}
+	return n, err
+}
+
+func (c *byteCountingConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.bytesSent.Add(uint64(n))
+	}
+	return n, err
+}
+
+func (c *byteCountingConn) ConnectionState() tls.ConnectionState {
+	if tc, ok := c.Conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
+		return tc.ConnectionState()
+	}
+	return tls.ConnectionState{}
 }
 
 // Conn is a QMux connection.
 // It implements the quic.Connection interface.
 type Conn struct {
-	conn     net.Conn
+	conn     net.Conn // This is actually a *byteCountingConn
 	config   *Config
 	isServer bool
 
@@ -84,10 +115,26 @@ type Conn struct {
 	mutex             sync.Mutex
 	lastFrameTime     time.Time
 	idleTimeout       time.Duration
-	peerMaxRecordSize uint64
+	peerMaxRecordSize atomic.Uint64
 
-	peerMaxDatagramFrameSize uint64
+	peerMaxDatagramFrameSize atomic.Uint64
 	incomingDatagrams        chan []byte
+
+	negotiatedProtocol string
+
+	// Statistics
+	packetsSent     atomic.Uint64
+	packetsReceived atomic.Uint64
+	bytesSent       atomic.Uint64 // Passed to byteCountingConn
+	bytesReceived   atomic.Uint64 // Passed to byteCountingConn
+
+	rttMutex sync.Mutex
+	rtt      struct {
+		min      time.Duration
+		latest   time.Duration
+		smoothed time.Duration
+		dev      time.Duration
+	}
 
 	// Frame queues
 	queueMutex    sync.Mutex
@@ -104,21 +151,25 @@ func newSession(conn net.Conn, config *Config, isServer bool) *Conn {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Conn{
-		conn:              conn,
 		config:            config,
 		isServer:          isServer,
-		rr:                wire.NewRecordReader(conn),
-		rw:                wire.NewRecordWriter(conn),
 		ctx:               ctx,
 		cancelCtx:         cancel,
-		sm:                newStreamManager(config, isServer),
-		connFC:            newFlowController(config.InitialConnectionReceiveWindow),
 		handshakeDone:     make(chan struct{}),
 		lastFrameTime:     time.Now(),
-		peerMaxRecordSize: 16382, // Spec default
 		incomingDatagrams: make(chan []byte, 100),
 		wake:              make(chan struct{}, 1),
 	}
+	s.peerMaxRecordSize.Store(16382) // Spec default
+	s.conn = &byteCountingConn{
+		Conn:          conn,
+		bytesSent:     &s.bytesSent,
+		bytesReceived: &s.bytesReceived,
+	}
+	s.rr = wire.NewRecordReader(s.conn)
+	s.rw = wire.NewRecordWriter(s.conn)
+	s.sm = newStreamManager(config, isServer)
+	s.connFC = newFlowController(config.InitialConnectionReceiveWindow)
 
 	// Drain goroutine to prevent handleFrame from blocking if session is closed
 	go func() {
@@ -167,6 +218,8 @@ func (s *Conn) run() {
 		s.mutex.Lock()
 		s.lastFrameTime = time.Now()
 		s.mutex.Unlock()
+
+		s.packetsReceived.Add(1)
 
 		if firstRecord {
 			if len(frames) == 0 {
@@ -217,6 +270,9 @@ func (s *Conn) sendTransportParameters() error {
 	if s.config.EnableDatagrams {
 		params = append(params, wire.TransportParameter{ID: wire.TransportParameterMaxDatagramFrameSize, Value: encodeVarInt(s.config.MaxDatagramFrameSize)})
 	}
+	if len(s.config.ApplicationProtocols) > 0 {
+		params = append(params, wire.TransportParameter{ID: wire.TransportParameterApplicationProtocol, Value: []byte(s.config.ApplicationProtocols[0])})
+	}
 	s.queueControlFrame(&wire.TransportParametersFrame{Parameters: params})
 	return nil
 }
@@ -224,32 +280,32 @@ func (s *Conn) sendTransportParameters() error {
 func (s *Conn) handleHandshakeParameters(f *wire.TransportParametersFrame) {
 	limitsUpdated := false
 	for _, p := range f.Parameters {
+		switch p.ID {
+		case wire.TransportParameterApplicationProtocol:
+			s.mutex.Lock()
+			s.negotiatedProtocol = string(p.Value)
+			s.mutex.Unlock()
+			continue
+		}
+
 		val, _ := wire.ReadVarInt(bytes.NewReader(p.Value))
 		switch p.ID {
 		case wire.TransportParameterInitialMaxData:
 			s.connFC.UpdateSendWindow(val)
 		case wire.TransportParameterInitialMaxStreamsBidi:
-			s.sm.mutex.Lock()
-			s.sm.peerMaxBidiStreams = val
+			s.sm.peerMaxBidiStreams.Store(val)
 			limitsUpdated = true
-			s.sm.mutex.Unlock()
 		case wire.TransportParameterInitialMaxStreamsUni:
-			s.sm.mutex.Lock()
-			s.sm.peerMaxUniStreams = val
+			s.sm.peerMaxUniStreams.Store(val)
 			limitsUpdated = true
-			s.sm.mutex.Unlock()
 		case wire.TransportParameterMaxIdleTimeout:
 			s.mutex.Lock()
 			s.idleTimeout = time.Duration(val) * time.Millisecond
 			s.mutex.Unlock()
 		case wire.TransportParameterMaxRecordSize:
-			s.mutex.Lock()
-			s.peerMaxRecordSize = val
-			s.mutex.Unlock()
+			s.peerMaxRecordSize.Store(val)
 		case wire.TransportParameterMaxDatagramFrameSize:
-			s.mutex.Lock()
-			s.peerMaxDatagramFrameSize = val
-			s.mutex.Unlock()
+			s.peerMaxDatagramFrameSize.Store(val)
 		}
 	}
 
@@ -339,8 +395,9 @@ func (s *Conn) writeFrames(frames ...wire.Frame) error {
 
 	s.mutex.Lock()
 	s.lastFrameTime = time.Now()
-	peerMax := s.peerMaxRecordSize
 	s.mutex.Unlock()
+
+	peerMax := s.peerMaxRecordSize.Load()
 
 	// Split frames into multiple records if total size exceeds peerMaxRecordSize.
 	// Note: A single frame MUST fit into peerMaxRecordSize.
@@ -370,6 +427,8 @@ func (s *Conn) writeFrames(frames ...wire.Frame) error {
 }
 
 func (s *Conn) sendRecord(frames []wire.Frame) error {
+	s.packetsSent.Add(1)
+
 	// Use a deadline to avoid blocking forever
 	s.conn.SetWriteDeadline(time.Now().Add(defaultWriteDeadline))
 	err := s.rw.WriteRecord(frames...)
@@ -438,9 +497,7 @@ func (s *Conn) SendMessage(p []byte) error {
 	if !s.config.EnableDatagrams {
 		return errors.New("datagrams not enabled")
 	}
-	s.mutex.Lock()
-	peerMax := s.peerMaxDatagramFrameSize
-	s.mutex.Unlock()
+	peerMax := s.peerMaxDatagramFrameSize.Load()
 
 	if uint64(len(p)) > peerMax {
 		return errors.New("message too large")
@@ -471,15 +528,15 @@ func (s *Conn) ReceiveMessage(ctx context.Context) ([]byte, error) {
 }
 
 func (s *Conn) handleMaxStreamsFrame(f *wire.MaxStreamsFrame) {
-	s.sm.mutex.Lock()
-	defer s.sm.mutex.Unlock()
 	if f.TypeField == wire.FrameTypeMaxStreamsBi {
-		s.sm.peerMaxBidiStreams = f.MaximumStreams
+		s.sm.peerMaxBidiStreams.Store(f.MaximumStreams)
 	} else {
-		s.sm.peerMaxUniStreams = f.MaximumStreams
+		s.sm.peerMaxUniStreams.Store(f.MaximumStreams)
 	}
+	s.sm.mutex.Lock()
 	close(s.sm.streamLimitWake)
 	s.sm.streamLimitWake = make(chan struct{})
+	s.sm.mutex.Unlock()
 }
 
 func (s *Conn) handlePingFrame(f *wire.PingFrame) {
@@ -488,6 +545,52 @@ func (s *Conn) handlePingFrame(f *wire.PingFrame) {
 			TypeField: wire.FrameTypePingResponse,
 			Sequence:  f.Sequence,
 		})
+		return
+	}
+
+	// Response: calculate RTT
+	sentTime := time.Unix(0, int64(f.Sequence))
+	rtt := time.Since(sentTime)
+
+	s.rttMutex.Lock()
+	defer s.rttMutex.Unlock()
+
+	s.rtt.latest = rtt
+	if s.rtt.min == 0 || rtt < s.rtt.min {
+		s.rtt.min = rtt
+	}
+
+	if s.rtt.smoothed == 0 {
+		s.rtt.smoothed = rtt
+		s.rtt.dev = rtt / 2
+	} else {
+		// RFC 9002 standard smoothed RTT
+		// smoothed_rtt = 7/8 * smoothed_rtt + 1/8 * latest_rtt
+		// rttvar = 3/4 * rttvar + 1/4 * abs(smoothed_rtt - latest_rtt)
+		diff := s.rtt.smoothed - rtt
+		if diff < 0 {
+			diff = -diff
+		}
+		s.rtt.dev = (3*s.rtt.dev + diff) / 4
+		s.rtt.smoothed = (7*s.rtt.smoothed + rtt) / 8
+	}
+}
+
+// ConnectionStats returns statistics about the connection.
+func (s *Conn) ConnectionStats() quic.ConnectionStats {
+	s.rttMutex.Lock()
+	rtt := s.rtt
+	s.rttMutex.Unlock()
+
+	return quic.ConnectionStats{
+		MinRTT:          rtt.min,
+		LatestRTT:       rtt.latest,
+		SmoothedRTT:     rtt.smoothed,
+		MeanDeviation:   rtt.dev,
+		BytesSent:       s.bytesSent.Load(),
+		PacketsSent:     s.packetsSent.Load(),
+		BytesReceived:   s.bytesReceived.Load(),
+		PacketsReceived: s.packetsReceived.Load(),
 	}
 }
 
@@ -573,28 +676,16 @@ func (s *Conn) CloseWithError(code quic.ApplicationErrorCode, msg string) error 
 	s.mutex.Unlock()
 
 	s.sm.mutex.Lock()
+	streams := make([]*baseStream, 0, len(s.sm.streams))
 	for _, str := range s.sm.streams {
-		str.mutex.Lock()
-		if !str.receive.receiveClosed {
-			str.receive.receiveClosed = true
-			str.receive.receiveError = s.closeErr
-			select {
-			case str.receive.readChan <- struct{}{}:
-			default:
-			}
-		}
-		if !str.send.sendClosed {
-			str.send.sendClosed = true
-			str.send.sendError = s.closeErr
-			select {
-			case str.send.writeChan <- struct{}{}:
-			default:
-			}
-		}
-		str.mutex.Unlock()
+		streams = append(streams, str)
 	}
 	close(s.sm.streamLimitWake)
 	s.sm.mutex.Unlock()
+
+	for _, str := range streams {
+		str.closeWithError(s.closeErr)
+	}
 
 	// Direct write for connection close
 	s.writeFrames(&wire.ConnectionCloseFrame{
@@ -683,13 +774,13 @@ func (s *Conn) OpenStreamSync(ctx context.Context) (*Stream, error) {
 	}
 
 	for {
-		s.sm.mutex.Lock()
-		if s.sm.openedBidiStreams < s.sm.peerMaxBidiStreams {
-			id := s.sm.nextBidiStreamID
-			s.sm.nextBidiStreamID += 4
-			s.sm.openedBidiStreams++
-			str := newBaseStream(id, s, s.config.InitialStreamReceiveWindow, s.config.InitialStreamReceiveWindow)
-			s.sm.streams[id] = str
+		if s.sm.openedBidiStreams.Load() < s.sm.peerMaxBidiStreams.Load() {
+			id := s.sm.nextBidiStreamID.Add(4) - 4
+			s.sm.openedBidiStreams.Add(1)
+			
+			s.sm.mutex.Lock()
+			str := newBaseStream(StreamID(id), s, s.config.InitialStreamReceiveWindow, s.config.InitialStreamReceiveWindow)
+			s.sm.streams[StreamID(id)] = str
 			s.sm.mutex.Unlock()
 
 			// Signal the peer about the new stream by sending a MAX_STREAM_DATA frame.
@@ -702,12 +793,13 @@ func (s *Conn) OpenStreamSync(ctx context.Context) (*Stream, error) {
 			return &Stream{baseStream: str}, nil
 		}
 
+		s.sm.mutex.Lock()
 		wake := s.sm.streamLimitWake
 		s.sm.mutex.Unlock()
 
 		s.queueControlFrame(&wire.StreamsBlockedFrame{
 			TypeField:      wire.FrameTypeStreamsBlockedBi,
-			MaximumStreams: s.sm.openedBidiStreams,
+			MaximumStreams: s.sm.openedBidiStreams.Load(),
 		})
 
 		select {
@@ -738,13 +830,13 @@ func (s *Conn) OpenUniStreamSync(ctx context.Context) (*SendStream, error) {
 	}
 
 	for {
-		s.sm.mutex.Lock()
-		if s.sm.openedUniStreams < s.sm.peerMaxUniStreams {
-			id := s.sm.nextUniStreamID
-			s.sm.nextUniStreamID += 4
-			s.sm.openedUniStreams++
-			str := newBaseStream(id, s, s.config.InitialStreamReceiveWindow, s.config.InitialStreamReceiveWindow)
-			s.sm.streams[id] = str
+		if s.sm.openedUniStreams.Load() < s.sm.peerMaxUniStreams.Load() {
+			id := s.sm.nextUniStreamID.Add(4) - 4
+			s.sm.openedUniStreams.Add(1)
+			
+			s.sm.mutex.Lock()
+			str := newBaseStream(StreamID(id), s, s.config.InitialStreamReceiveWindow, s.config.InitialStreamReceiveWindow)
+			s.sm.streams[StreamID(id)] = str
 			s.sm.mutex.Unlock()
 
 			// Signal the peer about the new stream by sending a STREAM frame with no data.
@@ -758,12 +850,13 @@ func (s *Conn) OpenUniStreamSync(ctx context.Context) (*SendStream, error) {
 			return &SendStream{baseStream: str}, nil
 		}
 
+		s.sm.mutex.Lock()
 		wake := s.sm.streamLimitWake
 		s.sm.mutex.Unlock()
 
 		s.queueControlFrame(&wire.StreamsBlockedFrame{
 			TypeField:      wire.FrameTypeStreamsBlockedUni,
-			MaximumStreams: s.sm.openedUniStreams,
+			MaximumStreams: s.sm.openedUniStreams.Load(),
 		})
 
 		select {
@@ -793,7 +886,33 @@ func (s *Conn) Context() context.Context { return s.ctx }
 
 // ConnectionState returns the connection state.
 func (s *Conn) ConnectionState() quic.ConnectionState {
-	return quic.ConnectionState{}
+	s.mutex.Lock()
+	proto := s.negotiatedProtocol
+	peerMaxDatagram := s.peerMaxDatagramFrameSize.Load()
+	s.mutex.Unlock()
+
+	state := quic.ConnectionState{
+		TLS: tls.ConnectionState{
+			NegotiatedProtocol: proto,
+		},
+		Used0RTT: false,
+		GSO:      false,
+	}
+
+	state.SupportsDatagrams.Local = s.config.EnableDatagrams
+	state.SupportsDatagrams.Remote = peerMaxDatagram > 0
+
+	// Check if the underlying connection provides more TLS info
+	if tc, ok := s.conn.(interface{ ConnectionState() tls.ConnectionState }); ok {
+		baseTLS := tc.ConnectionState()
+		// Merge base TLS info but keep our negotiated protocol
+		state.TLS = baseTLS
+		if state.TLS.NegotiatedProtocol == "" {
+			state.TLS.NegotiatedProtocol = proto
+		}
+	}
+
+	return state
 }
 
 func encodeVarInt(i uint64) []byte {

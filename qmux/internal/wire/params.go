@@ -20,6 +20,7 @@ const (
 	TransportParameterInitialMaxStreamsUni           uint64 = 0x09
 	TransportParameterMaxRecordSize                  uint64 = 0x3f5153300d0a0d0a
 	TransportParameterMaxDatagramFrameSize           uint64 = 0x20
+	TransportParameterApplicationProtocol            uint64 = 0x716d7578 // Custom: "qmux" in hex
 )
 
 // ParseTransportParameters parses transport parameters from a reader.
