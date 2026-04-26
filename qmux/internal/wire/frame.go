@@ -10,8 +10,6 @@ import (
 type FrameType uint64
 
 const (
-	FrameTypePadding            FrameType = 0x00
-	FrameTypePing               FrameType = 0x01
 	FrameTypeResetStream        FrameType = 0x04
 	FrameTypeStopSending        FrameType = 0x05
 	FrameTypeCrypto             FrameType = 0x06 // Prohibited in QMux
@@ -21,8 +19,6 @@ const (
 	FrameTypeMaxStreamData      FrameType = 0x11
 	FrameTypeMaxStreamsBi       FrameType = 0x12
 	FrameTypeMaxStreamsUni      FrameType = 0x13
-	FrameTypeDataBlocked        FrameType = 0x14
-	FrameTypeStreamDataBlocked  FrameType = 0x15
 	FrameTypeStreamsBlockedBi   FrameType = 0x16
 	FrameTypeStreamsBlockedUni  FrameType = 0x17
 	FrameTypeNewConnectionID    FrameType = 0x18 // Prohibited in QMux
@@ -33,10 +29,12 @@ const (
 	FrameTypeApplicationClose   FrameType = 0x1d // Application layer
 	FrameTypeHandshakeDone      FrameType = 0x1e // Prohibited in QMux
 
+	maxStreamFrameType FrameType = 0x0f
+
 	// QMux specific frames
-	FrameTypeQXTransportParameters FrameType = 0x3f5153300d0a0d0a
-	FrameTypeQXPingRequest          FrameType = 0x348c67529ef8c7bd
-	FrameTypeQXPingResponse         FrameType = 0x348c67529ef8c7be
+	FrameTypeTransportParameters FrameType = 0x3f5153300d0a0d0a
+	FrameTypePingRequest          FrameType = 0x348c67529ef8c7bd
+	FrameTypePingResponse         FrameType = 0x348c67529ef8c7be
 )
 
 // Frame is the interface for all frames.
@@ -55,10 +53,6 @@ func ParseFrame(r io.Reader) (Frame, error) {
 	ft := FrameType(t)
 
 	switch {
-	case ft == FrameTypePadding:
-		return &PaddingFrame{}, nil
-	case ft == FrameTypePing:
-		return &PingFrame{}, nil
 	case ft == FrameTypeResetStream:
 		return parseResetStreamFrame(r)
 	case ft == FrameTypeStopSending:
@@ -67,7 +61,7 @@ func ParseFrame(r io.Reader) (Frame, error) {
 		ft == FrameTypeRetireConnectionID || ft == FrameTypePathChallenge || ft == FrameTypePathResponse ||
 		ft == FrameTypeHandshakeDone:
 		return nil, fmt.Errorf("prohibited frame type: 0x%x", t)
-	case ft >= FrameTypeStream && ft <= 0x0f:
+	case ft >= FrameTypeStream && ft <= maxStreamFrameType:
 		return parseStreamFrame(r, ft)
 	case ft == FrameTypeMaxData:
 		return parseMaxDataFrame(r)
@@ -75,36 +69,18 @@ func ParseFrame(r io.Reader) (Frame, error) {
 		return parseMaxStreamDataFrame(r)
 	case ft == FrameTypeMaxStreamsBi || ft == FrameTypeMaxStreamsUni:
 		return parseMaxStreamsFrame(r, ft)
-	case ft == FrameTypeDataBlocked:
-		return parseDataBlockedFrame(r)
-	case ft == FrameTypeStreamDataBlocked:
-		return parseStreamDataBlockedFrame(r)
 	case ft == FrameTypeStreamsBlockedBi || ft == FrameTypeStreamsBlockedUni:
 		return parseStreamsBlockedFrame(r, ft)
 	case ft == FrameTypeConnectionClose || ft == FrameTypeApplicationClose:
 		return parseConnectionCloseFrame(r, ft)
-	case ft == FrameTypeQXTransportParameters:
-		return parseQXTransportParametersFrame(r)
-	case ft == FrameTypeQXPingRequest || ft == FrameTypeQXPingResponse:
-		return parseQXPingFrame(r, ft)
+	case ft == FrameTypeTransportParameters:
+		return parseTransportParametersFrame(r)
+	case ft == FrameTypePingRequest || ft == FrameTypePingResponse:
+		return parsePingFrame(r, ft)
 	default:
 		return nil, fmt.Errorf("unknown frame type: 0x%x", t)
 	}
 }
-
-// PaddingFrame is a PADDING frame.
-type PaddingFrame struct{}
-
-func (f *PaddingFrame) Type() FrameType { return FrameTypePadding }
-func (f *PaddingFrame) Write(w io.Writer) error { return WriteVarInt(w, uint64(f.Type())) }
-func (f *PaddingFrame) Length() uint64 { return 1 }
-
-// PingFrame is a PING frame.
-type PingFrame struct{}
-
-func (f *PingFrame) Type() FrameType { return FrameTypePing }
-func (f *PingFrame) Write(w io.Writer) error { return WriteVarInt(w, uint64(f.Type())) }
-func (f *PingFrame) Length() uint64 { return 1 }
 
 // ResetStreamFrame is a RESET_STREAM frame.
 type ResetStreamFrame struct {
@@ -178,6 +154,14 @@ func parseStopSendingFrame(r io.Reader) (*StopSendingFrame, error) {
 	return &StopSendingFrame{StreamID: sid, ErrorCode: ec}, nil
 }
 
+const (
+	streamTypeBitOffset = 0x04
+	streamTypeBitLength = 0x02
+	streamTypeBitFin    = 0x01
+
+	streamTypeMask = 0x08
+)
+
 // StreamFrame is a STREAM frame.
 type StreamFrame struct {
 	StreamID uint64
@@ -189,11 +173,11 @@ type StreamFrame struct {
 func (f *StreamFrame) Type() FrameType {
 	t := FrameTypeStream
 	if f.Offset > 0 {
-		t |= 0x04
+		t |= streamTypeBitOffset
 	}
-	t |= 0x02 // We always include length for simplicity in encoding
+	t |= streamTypeBitLength // We always include length for simplicity in encoding
 	if f.Fin {
-		t |= 0x01
+		t |= streamTypeBitFin
 	}
 	return t
 }
@@ -343,62 +327,6 @@ func parseMaxStreamsFrame(r io.Reader, ft FrameType) (*MaxStreamsFrame, error) {
 	return &MaxStreamsFrame{TypeField: ft, MaximumStreams: ms}, nil
 }
 
-// DataBlockedFrame is a DATA_BLOCKED frame.
-type DataBlockedFrame struct {
-	MaximumData uint64
-}
-
-func (f *DataBlockedFrame) Type() FrameType { return FrameTypeDataBlocked }
-func (f *DataBlockedFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
-		return err
-	}
-	return WriteVarInt(w, f.MaximumData)
-}
-func (f *DataBlockedFrame) Length() uint64 {
-	return uint64(VarIntLen(uint64(f.Type())) + VarIntLen(f.MaximumData))
-}
-
-func parseDataBlockedFrame(r io.Reader) (*DataBlockedFrame, error) {
-	md, err := ReadVarInt(r)
-	if err != nil {
-		return nil, err
-	}
-	return &DataBlockedFrame{MaximumData: md}, nil
-}
-
-// StreamDataBlockedFrame is a STREAM_DATA_BLOCKED frame.
-type StreamDataBlockedFrame struct {
-	StreamID          uint64
-	MaximumStreamData uint64
-}
-
-func (f *StreamDataBlockedFrame) Type() FrameType { return FrameTypeStreamDataBlocked }
-func (f *StreamDataBlockedFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
-		return err
-	}
-	if err := WriteVarInt(w, f.StreamID); err != nil {
-		return err
-	}
-	return WriteVarInt(w, f.MaximumStreamData)
-}
-func (f *StreamDataBlockedFrame) Length() uint64 {
-	return uint64(VarIntLen(uint64(f.Type())) + VarIntLen(f.StreamID) + VarIntLen(f.MaximumStreamData))
-}
-
-func parseStreamDataBlockedFrame(r io.Reader) (*StreamDataBlockedFrame, error) {
-	sid, err := ReadVarInt(r)
-	if err != nil {
-		return nil, err
-	}
-	msd, err := ReadVarInt(r)
-	if err != nil {
-		return nil, err
-	}
-	return &StreamDataBlockedFrame{StreamID: sid, MaximumStreamData: msd}, nil
-}
-
 // StreamsBlockedFrame is a STREAMS_BLOCKED frame.
 type StreamsBlockedFrame struct {
 	TypeField      FrameType
@@ -489,19 +417,19 @@ func parseConnectionCloseFrame(r io.Reader, ft FrameType) (*ConnectionCloseFrame
 	}, nil
 }
 
-// QXTransportParametersFrame is a QX_TRANSPORT_PARAMETERS frame.
-type QXTransportParametersFrame struct {
+// TransportParametersFrame is a QX_TRANSPORT_PARAMETERS frame.
+type TransportParametersFrame struct {
 	Parameters []TransportParameter
 }
 
-func (f *QXTransportParametersFrame) Type() FrameType { return FrameTypeQXTransportParameters }
-func (f *QXTransportParametersFrame) Write(w io.Writer) error {
+func (f *TransportParametersFrame) Type() FrameType { return FrameTypeTransportParameters }
+func (f *TransportParametersFrame) Write(w io.Writer) error {
 	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
 	return WriteTransportParameters(w, f.Parameters)
 }
-func (f *QXTransportParametersFrame) Length() uint64 {
+func (f *TransportParametersFrame) Length() uint64 {
 	l := uint64(8) // QX_TRANSPORT_PARAMETERS type is 8 bytes
 	for _, p := range f.Parameters {
 		l += uint64(VarIntLen(p.ID))
@@ -511,22 +439,22 @@ func (f *QXTransportParametersFrame) Length() uint64 {
 	return l
 }
 
-func parseQXTransportParametersFrame(r io.Reader) (*QXTransportParametersFrame, error) {
+func parseTransportParametersFrame(r io.Reader) (*TransportParametersFrame, error) {
 	params, err := ParseTransportParameters(r)
 	if err != nil {
 		return nil, err
 	}
-	return &QXTransportParametersFrame{Parameters: params}, nil
+	return &TransportParametersFrame{Parameters: params}, nil
 }
 
-// QXPingFrame is a QX_PING frame.
-type QXPingFrame struct {
+// PingFrame is a QX_PING frame.
+type PingFrame struct {
 	TypeField FrameType
 	Sequence  uint64
 }
 
-func (f *QXPingFrame) Type() FrameType { return f.TypeField }
-func (f *QXPingFrame) Write(w io.Writer) error {
+func (f *PingFrame) Type() FrameType { return f.TypeField }
+func (f *PingFrame) Write(w io.Writer) error {
 	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
@@ -535,16 +463,16 @@ func (f *QXPingFrame) Write(w io.Writer) error {
 	_, err := w.Write(b[:])
 	return err
 }
-func (f *QXPingFrame) Length() uint64 {
+func (f *PingFrame) Length() uint64 {
 	return 8 + 8
 }
 
-func parseQXPingFrame(r io.Reader, ft FrameType) (*QXPingFrame, error) {
+func parsePingFrame(r io.Reader, ft FrameType) (*PingFrame, error) {
 	var b [8]byte
 	if _, err := io.ReadFull(r, b[:]); err != nil {
 		return nil, err
 	}
-	return &QXPingFrame{
+	return &PingFrame{
 		TypeField: ft,
 		Sequence:  binary.BigEndian.Uint64(b[:]),
 	}, nil

@@ -13,6 +13,13 @@ import (
 // StreamID is a 62-bit integer as defined in QUIC.
 type StreamID = quic.StreamID
 
+const (
+	defaultMaxIncomingStreams      = 100
+	defaultMaxIncomingUniStreams   = 100
+	defaultInitialStreamWindow     = 64 * 1024
+	defaultInitialConnectionWindow = 64 * 1024
+)
+
 // Config contains configuration for a QMux connection.
 type Config struct {
 	// MaxIncomingStreams is the maximum number of concurrent bidirectional streams
@@ -29,6 +36,19 @@ type Config struct {
 	MaxRecordSize uint64
 	// KeepAlivePeriod is the interval between QX_PING frames.
 	KeepAlivePeriod time.Duration
+	// MaxIdleTimeout is the maximum idle time before the connection is closed.
+	MaxIdleTimeout time.Duration
+}
+
+// DefaultConfig returns the default configuration.
+func DefaultConfig() *Config {
+	return &Config{
+		MaxIncomingStreams:             defaultMaxIncomingStreams,
+		MaxIncomingUniStreams:          defaultMaxIncomingUniStreams,
+		InitialStreamReceiveWindow:     defaultInitialStreamWindow,
+		InitialConnectionReceiveWindow: defaultInitialConnectionWindow,
+		MaxIdleTimeout:                 30 * time.Second,
+	}
 }
 
 // Dial establishes a QMux connection over an existing network connection.
@@ -36,13 +56,7 @@ type Config struct {
 func Dial(conn net.Conn, config *Config) (*Conn, error) {
 	s := newSession(conn, config, false)
 	go s.run()
-
-	select {
-	case <-s.handshakeDone:
-		return s, nil
-	case <-s.ctx.Done():
-		return nil, s.closeErr
-	}
+	return s, nil
 }
 
 // Server starts a QMux connection over an existing network connection.
@@ -50,11 +64,5 @@ func Dial(conn net.Conn, config *Config) (*Conn, error) {
 func Server(conn net.Conn, config *Config) (*Conn, error) {
 	s := newSession(conn, config, true)
 	go s.run()
-
-	select {
-	case <-s.handshakeDone:
-		return s, nil
-	case <-s.ctx.Done():
-		return nil, s.closeErr
-	}
+	return s, nil
 }

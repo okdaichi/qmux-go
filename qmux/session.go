@@ -8,10 +8,57 @@ import (
 	"sync"
 	"time"
 
-	"github.com/okdaichi/qmux-go/qmux/internal/flowcontrol"
 	"github.com/okdaichi/qmux-go/qmux/internal/wire"
 	"github.com/quic-go/quic-go"
 )
+
+const (
+	defaultWriteDeadline = 5 * time.Second
+
+	// Stream ID bits
+	streamIDClientInitiated = 0x00
+	streamIDServerInitiated = 0x01
+	streamIDBidirectional   = 0x00
+	streamIDUnidirectional  = 0x02
+)
+
+type streamManager struct {
+	mutex   sync.Mutex
+	streams map[StreamID]*baseStream
+
+	nextBidiStreamID StreamID
+	nextUniStreamID  StreamID
+
+	// Peer stream limits
+	peerMaxBidiStreams uint64
+	peerMaxUniStreams  uint64
+	openedBidiStreams  uint64
+	openedUniStreams   uint64
+	streamLimitWake    chan struct{}
+
+	incomingBidi chan *Stream
+	incomingUni  chan *ReceiveStream
+}
+
+func newStreamManager(config *Config, isServer bool) *streamManager {
+	sm := &streamManager{
+		streams:            make(map[StreamID]*baseStream),
+		incomingBidi:       make(chan *Stream, int(config.MaxIncomingStreams)),
+		incomingUni:        make(chan *ReceiveStream, int(config.MaxIncomingUniStreams)),
+		streamLimitWake:    make(chan struct{}),
+		peerMaxBidiStreams: 100, // Initial default
+		peerMaxUniStreams:  100,
+	}
+
+	if isServer {
+		sm.nextBidiStreamID = StreamID(streamIDServerInitiated | streamIDBidirectional)
+		sm.nextUniStreamID = StreamID(streamIDServerInitiated | streamIDUnidirectional)
+	} else {
+		sm.nextBidiStreamID = StreamID(streamIDClientInitiated | streamIDBidirectional)
+		sm.nextUniStreamID = StreamID(streamIDClientInitiated | streamIDUnidirectional)
+	}
+	return sm
+}
 
 // Conn is a QMux connection.
 // It implements the quic.Connection interface.
@@ -26,126 +73,84 @@ type Conn struct {
 	ctx       context.Context
 	cancelCtx context.CancelFunc
 
-	mutex      sync.Mutex
 	writeMutex sync.Mutex
-	streams    map[StreamID]*baseStream
+	sm         *streamManager
 
-	nextBidiStreamID StreamID
-	nextUniStreamID  StreamID
-
-	// Peer stream limits
-	peerMaxBidiStreams uint64
-	peerMaxUniStreams  uint64
-	openedBidiStreams  uint64
-	openedUniStreams   uint64
-	streamLimitWake    chan struct{}
-
-	incomingBidi chan *Stream
-	incomingUni  chan *ReceiveStream
-
-	connFC *flowcontrol.FlowController
+	connFC *flowController
 
 	handshakeDone chan struct{}
 	closeErr      error
 
+	mutex         sync.Mutex
 	lastFrameTime time.Time
 	idleTimeout   time.Duration
 
-	// sendQueue for asynchronous frame sending
-	sendQueue chan wire.Frame
+	// Frame queues
+	queueMutex    sync.Mutex
+	controlFrames []wire.Frame
+	streamFrames  []wire.Frame
+	wake          chan struct{}
 }
 
 func newSession(conn net.Conn, config *Config, isServer bool) *Conn {
 	if config == nil {
-		config = &Config{
-			MaxIncomingStreams:             100,
-			MaxIncomingUniStreams:          100,
-			InitialStreamReceiveWindow:     65536,
-			InitialConnectionReceiveWindow: 65536,
-		}
+		config = DefaultConfig()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Conn{
-		conn:            conn,
-		config:          config,
-		isServer:        isServer,
-		rr:              wire.NewRecordReader(conn),
-		rw:              wire.NewRecordWriter(conn),
-		ctx:             ctx,
-		cancelCtx:       cancel,
-		streams:         make(map[StreamID]*baseStream),
-		incomingBidi:    make(chan *Stream, int(config.MaxIncomingStreams)),
-		incomingUni:     make(chan *ReceiveStream, int(config.MaxIncomingUniStreams)),
-		connFC:          flowcontrol.NewFlowController(config.InitialConnectionReceiveWindow),
-		handshakeDone:   make(chan struct{}),
-		streamLimitWake: make(chan struct{}),
-		lastFrameTime:   time.Now(),
-		sendQueue:       make(chan wire.Frame, 1024),
+		conn:          conn,
+		config:        config,
+		isServer:      isServer,
+		rr:            wire.NewRecordReader(conn),
+		rw:            wire.NewRecordWriter(conn),
+		ctx:           ctx,
+		cancelCtx:     cancel,
+		sm:            newStreamManager(config, isServer),
+		connFC:        newFlowController(config.InitialConnectionReceiveWindow),
+		handshakeDone: make(chan struct{}),
+		lastFrameTime: time.Now(),
+		wake:          make(chan struct{}, 1),
 	}
 
-	if isServer {
-		s.nextBidiStreamID = 1
-		s.nextUniStreamID = 3
-	} else {
-		s.nextBidiStreamID = 0
-		s.nextUniStreamID = 2
-	}
+	// Drain goroutine to prevent handleFrame from blocking if session is closed
+	go func() {
+		<-ctx.Done()
+		for {
+			select {
+			case <-s.sm.incomingBidi:
+			case <-s.sm.incomingUni:
+			default:
+				return
+			}
+		}
+	}()
 
 	return s
 }
 
 func (s *Conn) run() {
-	defer s.Close()
-
 	go s.writeLoop()
+	
+	defer s.Close()
+	defer func() {
+		// Ensure handshakeDone is always closed
+		select {
+		case <-s.handshakeDone:
+		default:
+			close(s.handshakeDone)
+		}
+	}()
 
-	if err := s.handshake(); err != nil {
-		s.CloseWithError(0, err.Error())
+	// 1. Send our parameters
+	if err := s.sendTransportParameters(); err != nil {
+		s.CloseWithError(quic.ApplicationErrorCode(InternalError), err.Error())
 		return
 	}
-	close(s.handshakeDone)
 
-	if s.config.KeepAlivePeriod > 0 {
-		go func() {
-			ticker := time.NewTicker(s.config.KeepAlivePeriod)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					s.queueFrame(&wire.QXPingFrame{
-						TypeField: wire.FrameTypeQXPingRequest,
-						Sequence:  uint64(time.Now().UnixNano()),
-					})
-				case <-s.ctx.Done():
-					return
-				}
-			}
-		}()
-	}
-
-	if s.idleTimeout > 0 {
-		go func() {
-			ticker := time.NewTicker(s.idleTimeout / 2)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					s.mutex.Lock()
-					if time.Since(s.lastFrameTime) > s.idleTimeout {
-						s.mutex.Unlock()
-						s.CloseWithError(0, "idle timeout")
-						return
-					}
-					s.mutex.Unlock()
-				case <-s.ctx.Done():
-					return
-				}
-			}
-		}()
-	}
-
+	// 2. Read loop
+	firstRecord := true
 	for {
 		frames, err := s.rr.ReadRecord()
 		if err != nil {
@@ -157,36 +162,38 @@ func (s *Conn) run() {
 		s.lastFrameTime = time.Now()
 		s.mutex.Unlock()
 
+		if firstRecord {
+			if len(frames) == 0 {
+				s.CloseWithError(quic.ApplicationErrorCode(TransportParameterError), "empty initial record")
+				return
+			}
+			f, ok := frames[0].(*wire.TransportParametersFrame)
+			if !ok {
+				s.CloseWithError(quic.ApplicationErrorCode(TransportParameterError), "first frame is not QX_TRANSPORT_PARAMETERS")
+				return
+			}
+			s.handleHandshakeParameters(f)
+			close(s.handshakeDone)
+			firstRecord = false
+			frames = frames[1:]
+			s.startBackgroundTasks()
+		}
+
 		for _, f := range frames {
 			if err := s.handleFrame(f); err != nil {
-				s.CloseWithError(0, err.Error())
+				var appErr *quic.ApplicationError
+				if errors.As(err, &appErr) {
+					s.CloseWithError(appErr.ErrorCode, appErr.ErrorMessage)
+				} else {
+					s.CloseWithError(0, err.Error())
+				}
 				return
 			}
 		}
 	}
 }
 
-func (s *Conn) writeLoop() {
-	for {
-		select {
-		case f := <-s.sendQueue:
-			if err := s.writeFrame(f); err != nil {
-				s.CloseWithError(0, err.Error())
-				return
-			}
-		case <-s.ctx.Done():
-			return
-		}
-	}
-}
-
-func (s *Conn) writeFrame(f wire.Frame) error {
-	s.writeMutex.Lock()
-	defer s.writeMutex.Unlock()
-	return s.rw.WriteRecord(f)
-}
-
-func (s *Conn) handshake() error {
+func (s *Conn) sendTransportParameters() error {
 	params := []wire.TransportParameter{
 		{ID: wire.TransportParameterInitialMaxData, Value: encodeVarInt(s.config.InitialConnectionReceiveWindow)},
 		{ID: wire.TransportParameterInitialMaxStreamDataBidiLocal, Value: encodeVarInt(s.config.InitialStreamReceiveWindow)},
@@ -196,43 +203,126 @@ func (s *Conn) handshake() error {
 	if s.config.MaxRecordSize > 0 {
 		params = append(params, wire.TransportParameter{ID: wire.TransportParameterMaxRecordSize, Value: encodeVarInt(s.config.MaxRecordSize)})
 	}
-
-	writeErrChan := make(chan error, 1)
-	go func() {
-		writeErrChan <- s.writeFrame(&wire.QXTransportParametersFrame{Parameters: params})
-	}()
-
-	frames, err := s.rr.ReadRecord()
-	if err != nil {
-		return err
+	if s.config.MaxIdleTimeout > 0 {
+		params = append(params, wire.TransportParameter{ID: wire.TransportParameterMaxIdleTimeout, Value: encodeVarInt(uint64(s.config.MaxIdleTimeout / time.Millisecond))})
 	}
-	if len(frames) == 0 {
-		return &QMuxError{ErrorCode: TransportParameterError, Message: "empty initial record"}
-	}
-	f, ok := frames[0].(*wire.QXTransportParametersFrame)
-	if !ok {
-		return &QMuxError{ErrorCode: TransportParameterError, Message: "first frame is not QX_TRANSPORT_PARAMETERS"}
-	}
+	s.queueControlFrame(&wire.TransportParametersFrame{Parameters: params})
+	return nil
+}
 
+func (s *Conn) handleHandshakeParameters(f *wire.TransportParametersFrame) {
+	limitsUpdated := false
 	for _, p := range f.Parameters {
 		val, _ := wire.ReadVarInt(bytes.NewReader(p.Value))
 		switch p.ID {
 		case wire.TransportParameterInitialMaxData:
 			s.connFC.UpdateSendWindow(val)
 		case wire.TransportParameterInitialMaxStreamsBidi:
-			s.mutex.Lock()
-			s.peerMaxBidiStreams = val
-			s.mutex.Unlock()
+			s.sm.mutex.Lock()
+			s.sm.peerMaxBidiStreams = val
+			limitsUpdated = true
+			s.sm.mutex.Unlock()
 		case wire.TransportParameterInitialMaxStreamsUni:
-			s.mutex.Lock()
-			s.peerMaxUniStreams = val
-			s.mutex.Unlock()
+			s.sm.mutex.Lock()
+			s.sm.peerMaxUniStreams = val
+			limitsUpdated = true
+			s.sm.mutex.Unlock()
 		case wire.TransportParameterMaxIdleTimeout:
+			s.mutex.Lock()
 			s.idleTimeout = time.Duration(val) * time.Millisecond
+			s.mutex.Unlock()
 		}
 	}
 
-	return <-writeErrChan
+	if limitsUpdated {
+		s.sm.mutex.Lock()
+		close(s.sm.streamLimitWake)
+		s.sm.streamLimitWake = make(chan struct{})
+		s.sm.mutex.Unlock()
+	}
+}
+
+func (s *Conn) startBackgroundTasks() {
+	if s.config.KeepAlivePeriod > 0 {
+		go func() {
+			ticker := time.NewTicker(s.config.KeepAlivePeriod)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					s.queueControlFrame(&wire.PingFrame{
+						TypeField: wire.FrameTypePingRequest,
+						Sequence:  uint64(time.Now().UnixNano()),
+					})
+				case <-s.ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	s.mutex.Lock()
+	idleTimeout := s.idleTimeout
+	s.mutex.Unlock()
+
+	if idleTimeout > 0 {
+		go func() {
+			ticker := time.NewTicker(idleTimeout / 2)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					s.mutex.Lock()
+					last := s.lastFrameTime
+					s.mutex.Unlock()
+					if time.Since(last) > idleTimeout {
+						s.CloseWithError(quic.ApplicationErrorCode(InternalError), "idle timeout")
+						return
+					}
+				case <-s.ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+}
+
+func (s *Conn) writeLoop() {
+	for {
+		s.queueMutex.Lock()
+		for len(s.controlFrames) == 0 && len(s.streamFrames) == 0 {
+			s.queueMutex.Unlock()
+			select {
+			case <-s.wake:
+				s.queueMutex.Lock()
+			case <-s.ctx.Done():
+				return
+			}
+		}
+
+		frames := make([]wire.Frame, 0, len(s.controlFrames)+len(s.streamFrames))
+		frames = append(frames, s.controlFrames...)
+		s.controlFrames = s.controlFrames[:0]
+		frames = append(frames, s.streamFrames...)
+		s.streamFrames = s.streamFrames[:0]
+		s.queueMutex.Unlock()
+
+		if err := s.writeFrames(frames...); err != nil {
+			s.CloseWithError(0, err.Error())
+			return
+		}
+	}
+}
+
+func (s *Conn) writeFrames(frames ...wire.Frame) error {
+	s.writeMutex.Lock()
+	defer s.writeMutex.Unlock()
+
+	// Use a deadline to avoid blocking forever
+	s.conn.SetWriteDeadline(time.Now().Add(defaultWriteDeadline))
+	err := s.rw.WriteRecord(frames...)
+	s.conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
 func (s *Conn) handleFrame(f wire.Frame) error {
@@ -258,81 +348,100 @@ func (s *Conn) handleFrame(f wire.Frame) error {
 	case *wire.MaxDataFrame:
 		s.connFC.UpdateSendWindow(ff.MaximumData)
 	case *wire.MaxStreamDataFrame:
-		str := s.getBaseStream(StreamID(ff.StreamID))
-		if str != nil {
-			str.sendFC.UpdateSendWindow(ff.MaximumStreamData)
+		str, err := s.getOrCreateBaseStream(StreamID(ff.StreamID))
+		if err != nil {
+			return err
 		}
-	case *wire.QXTransportParametersFrame:
-		return &QMuxError{ErrorCode: ProtocolViolationError, Message: "duplicate QX_TRANSPORT_PARAMETERS"}
+		str.send.sendFC.UpdateSendWindow(ff.MaximumStreamData)
+	case *wire.TransportParametersFrame:
+		return &Error{ErrorCode: ProtocolViolationError, Message: "duplicate QX_TRANSPORT_PARAMETERS"}
 	case *wire.MaxStreamsFrame:
-		s.mutex.Lock()
-		if ff.TypeField == wire.FrameTypeMaxStreamsBi {
-			s.peerMaxBidiStreams = ff.MaximumStreams
-		} else {
-			s.peerMaxUniStreams = ff.MaximumStreams
-		}
-		close(s.streamLimitWake)
-		s.streamLimitWake = make(chan struct{})
-		s.mutex.Unlock()
+		s.handleMaxStreamsFrame(ff)
 	case *wire.StreamsBlockedFrame:
 		return nil
-	case *wire.QXPingFrame:
-		if ff.TypeField == wire.FrameTypeQXPingRequest {
-			s.queueFrame(&wire.QXPingFrame{
-				TypeField: wire.FrameTypeQXPingResponse,
-				Sequence:  ff.Sequence,
-			})
-		}
+	case *wire.PingFrame:
+		s.handlePingFrame(ff)
 	case *wire.ConnectionCloseFrame:
 		return &quic.ApplicationError{ErrorCode: quic.ApplicationErrorCode(ff.ErrorCode), ErrorMessage: ff.ReasonPhrase}
 	}
 	return nil
 }
 
+func (s *Conn) handleMaxStreamsFrame(f *wire.MaxStreamsFrame) {
+	s.sm.mutex.Lock()
+	defer s.sm.mutex.Unlock()
+	if f.TypeField == wire.FrameTypeMaxStreamsBi {
+		s.sm.peerMaxBidiStreams = f.MaximumStreams
+	} else {
+		s.sm.peerMaxUniStreams = f.MaximumStreams
+	}
+	close(s.sm.streamLimitWake)
+	s.sm.streamLimitWake = make(chan struct{})
+}
+
+func (s *Conn) handlePingFrame(f *wire.PingFrame) {
+	if f.TypeField == wire.FrameTypePingRequest {
+		s.queueControlFrame(&wire.PingFrame{
+			TypeField: wire.FrameTypePingResponse,
+			Sequence:  f.Sequence,
+		})
+	}
+}
+
 func (s *Conn) getBaseStream(id StreamID) *baseStream {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return s.streams[id]
+	s.sm.mutex.Lock()
+	defer s.sm.mutex.Unlock()
+	return s.sm.streams[id]
 }
 
 func (s *Conn) getOrCreateBaseStream(id StreamID) (*baseStream, error) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	if str, ok := s.streams[id]; ok {
+	s.sm.mutex.Lock()
+	defer s.sm.mutex.Unlock()
+	if str, ok := s.sm.streams[id]; ok {
 		return str, nil
 	}
 
 	str := newBaseStream(id, s, s.config.InitialStreamReceiveWindow, s.config.InitialStreamReceiveWindow)
-	s.streams[id] = str
+	s.sm.streams[id] = str
 
-	if id%4 == 0 || id%4 == 1 {
+	if id&streamIDUnidirectional == 0 { // Bidirectional
 		select {
-		case s.incomingBidi <- &Stream{baseStream: str}:
+		case s.sm.incomingBidi <- &Stream{baseStream: str}:
 		default:
-			return nil, &QMuxError{ErrorCode: StreamLimitError, Message: "too many concurrent streams"}
+			return nil, &Error{ErrorCode: StreamLimitError, Message: "too many concurrent streams"}
 		}
 	} else {
 		select {
-		case s.incomingUni <- &ReceiveStream{baseStream: str}:
+		case s.sm.incomingUni <- &ReceiveStream{baseStream: str}:
 		default:
-			return nil, &QMuxError{ErrorCode: StreamLimitError, Message: "too many concurrent uni streams"}
+			return nil, &Error{ErrorCode: StreamLimitError, Message: "too many concurrent uni streams"}
 		}
 	}
 	return str, nil
 }
 
 func (s *Conn) sendFrame(f wire.Frame) error {
-	select {
-	case s.sendQueue <- f:
-		return nil
-	case <-s.ctx.Done():
-		return s.closeErr
-	}
+	s.queueMutex.Lock()
+	s.streamFrames = append(s.streamFrames, f)
+	s.queueMutex.Unlock()
+	s.signalWake()
+	return nil
 }
 
 func (s *Conn) queueFrame(f wire.Frame) {
+	_ = s.sendFrame(f)
+}
+
+func (s *Conn) queueControlFrame(f wire.Frame) {
+	s.queueMutex.Lock()
+	s.controlFrames = append(s.controlFrames, f)
+	s.queueMutex.Unlock()
+	s.signalWake()
+}
+
+func (s *Conn) signalWake() {
 	select {
-	case s.sendQueue <- f:
+	case s.wake <- struct{}{}:
 	default:
 	}
 }
@@ -351,29 +460,78 @@ func (s *Conn) CloseWithError(code quic.ApplicationErrorCode, msg string) error 
 	}
 	s.closeErr = &quic.ApplicationError{ErrorCode: code, ErrorMessage: msg}
 	s.cancelCtx()
-
-	for _, str := range s.streams {
-		str.handleResetStreamFrame(&wire.ResetStreamFrame{ErrorCode: uint64(code)})
-	}
-	close(s.streamLimitWake)
 	s.mutex.Unlock()
 
-	s.writeFrame(&wire.ConnectionCloseFrame{
+	s.sm.mutex.Lock()
+	for _, str := range s.sm.streams {
+		str.mutex.Lock()
+		if !str.receive.receiveClosed {
+			str.receive.receiveClosed = true
+			str.receive.receiveError = s.closeErr
+			select {
+			case str.receive.readChan <- struct{}{}:
+			default:
+			}
+		}
+		if !str.send.sendClosed {
+			str.send.sendClosed = true
+			str.send.sendError = s.closeErr
+			select {
+			case str.send.writeChan <- struct{}{}:
+			default:
+			}
+		}
+		str.mutex.Unlock()
+	}
+	close(s.sm.streamLimitWake)
+	s.sm.mutex.Unlock()
+
+	// Direct write for connection close
+	s.writeFrames(&wire.ConnectionCloseFrame{
 		TypeField:    wire.FrameTypeApplicationClose,
 		ErrorCode:    uint64(code),
 		ReasonPhrase: msg,
 	})
+	
 	return s.conn.Close()
+}
+
+func (s *Conn) waitHandshake(ctx context.Context) error {
+	select {
+	case <-s.handshakeDone:
+		s.mutex.Lock()
+		err := s.closeErr
+		s.mutex.Unlock()
+		return err
+	case <-s.ctx.Done():
+		s.mutex.Lock()
+		if s.closeErr != nil {
+			err := s.closeErr
+			s.mutex.Unlock()
+			return err
+		}
+		s.mutex.Unlock()
+		return errors.New("connection closed")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // AcceptStream accepts the next incoming bidirectional stream.
 func (s *Conn) AcceptStream(ctx context.Context) (*Stream, error) {
+	if err := s.waitHandshake(ctx); err != nil {
+		return nil, err
+	}
+
 	select {
-	case str := <-s.incomingBidi:
+	case str := <-s.sm.incomingBidi:
 		return str, nil
 	case <-s.ctx.Done():
-		if s.closeErr != nil {
-			return nil, s.closeErr
+		s.mutex.Lock()
+		err := s.closeErr
+		s.mutex.Unlock()
+		if err != nil {
+			return nil, err
 		}
 		return nil, errors.New("connection closed")
 	case <-ctx.Done():
@@ -383,12 +541,19 @@ func (s *Conn) AcceptStream(ctx context.Context) (*Stream, error) {
 
 // AcceptUniStream accepts the next incoming unidirectional stream.
 func (s *Conn) AcceptUniStream(ctx context.Context) (*ReceiveStream, error) {
+	if err := s.waitHandshake(ctx); err != nil {
+		return nil, err
+	}
+
 	select {
-	case str := <-s.incomingUni:
+	case str := <-s.sm.incomingUni:
 		return str, nil
 	case <-s.ctx.Done():
-		if s.closeErr != nil {
-			return nil, s.closeErr
+		s.mutex.Lock()
+		err := s.closeErr
+		s.mutex.Unlock()
+		if err != nil {
+			return nil, err
 		}
 		return nil, errors.New("connection closed")
 	case <-ctx.Done():
@@ -403,30 +568,48 @@ func (s *Conn) OpenStream() (*Stream, error) {
 
 // OpenStreamSync opens a new bidirectional stream, blocking until one is available.
 func (s *Conn) OpenStreamSync(ctx context.Context) (*Stream, error) {
+	if err := s.waitHandshake(ctx); err != nil {
+		return nil, err
+	}
+
 	for {
-		s.mutex.Lock()
-		if s.openedBidiStreams < s.peerMaxBidiStreams {
-			id := s.nextBidiStreamID
-			s.nextBidiStreamID += 4
-			s.openedBidiStreams++
+		s.sm.mutex.Lock()
+		if s.sm.openedBidiStreams < s.sm.peerMaxBidiStreams {
+			id := s.sm.nextBidiStreamID
+			s.sm.nextBidiStreamID += 4
+			s.sm.openedBidiStreams++
 			str := newBaseStream(id, s, s.config.InitialStreamReceiveWindow, s.config.InitialStreamReceiveWindow)
-			s.streams[id] = str
-			s.mutex.Unlock()
+			s.sm.streams[id] = str
+			s.sm.mutex.Unlock()
+
+			// Signal the peer about the new stream by sending a MAX_STREAM_DATA frame.
+			// This allows the peer's AcceptStream to return even if no data is sent yet.
+			s.queueControlFrame(&wire.MaxStreamDataFrame{
+				StreamID:          uint64(id),
+				MaximumStreamData: s.config.InitialStreamReceiveWindow,
+			})
+
 			return &Stream{baseStream: str}, nil
 		}
 
-		wake := s.streamLimitWake
-		s.mutex.Unlock()
+		wake := s.sm.streamLimitWake
+		s.sm.mutex.Unlock()
 
-		s.queueFrame(&wire.StreamsBlockedFrame{
+		s.queueControlFrame(&wire.StreamsBlockedFrame{
 			TypeField:      wire.FrameTypeStreamsBlockedBi,
-			MaximumStreams: s.openedBidiStreams,
+			MaximumStreams: s.sm.openedBidiStreams,
 		})
 
 		select {
 		case <-wake:
 		case <-s.ctx.Done():
-			return nil, s.closeErr
+			s.mutex.Lock()
+			err := s.closeErr
+			s.mutex.Unlock()
+			if err != nil {
+				return nil, err
+			}
+			return nil, errors.New("connection closed")
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -440,30 +623,49 @@ func (s *Conn) OpenUniStream() (*SendStream, error) {
 
 // OpenUniStreamSync opens a new unidirectional stream, blocking until one is available.
 func (s *Conn) OpenUniStreamSync(ctx context.Context) (*SendStream, error) {
+	if err := s.waitHandshake(ctx); err != nil {
+		return nil, err
+	}
+
 	for {
-		s.mutex.Lock()
-		if s.openedUniStreams < s.peerMaxUniStreams {
-			id := s.nextUniStreamID
-			s.nextUniStreamID += 4
-			s.openedUniStreams++
+		s.sm.mutex.Lock()
+		if s.sm.openedUniStreams < s.sm.peerMaxUniStreams {
+			id := s.sm.nextUniStreamID
+			s.sm.nextUniStreamID += 4
+			s.sm.openedUniStreams++
 			str := newBaseStream(id, s, s.config.InitialStreamReceiveWindow, s.config.InitialStreamReceiveWindow)
-			s.streams[id] = str
-			s.mutex.Unlock()
+			s.sm.streams[id] = str
+			s.sm.mutex.Unlock()
+
+			// Signal the peer about the new stream by sending a STREAM frame with no data.
+			s.queueFrame(&wire.StreamFrame{
+				StreamID: uint64(id),
+				Offset:   0,
+				Data:     nil,
+				Fin:      false,
+			})
+
 			return &SendStream{baseStream: str}, nil
 		}
 
-		wake := s.streamLimitWake
-		s.mutex.Unlock()
+		wake := s.sm.streamLimitWake
+		s.sm.mutex.Unlock()
 
-		s.queueFrame(&wire.StreamsBlockedFrame{
+		s.queueControlFrame(&wire.StreamsBlockedFrame{
 			TypeField:      wire.FrameTypeStreamsBlockedUni,
-			MaximumStreams: s.openedUniStreams,
+			MaximumStreams: s.sm.openedUniStreams,
 		})
 
 		select {
 		case <-wake:
 		case <-s.ctx.Done():
-			return nil, s.closeErr
+			s.mutex.Lock()
+			err := s.closeErr
+			s.mutex.Unlock()
+			if err != nil {
+				return nil, err
+			}
+			return nil, errors.New("connection closed")
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}

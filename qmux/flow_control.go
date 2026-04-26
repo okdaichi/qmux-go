@@ -1,29 +1,28 @@
-package flowcontrol
+package qmux
 
 import (
 	"sync"
 )
 
-// FlowController manages the flow control window.
-type FlowController struct {
+// flowController manages the flow control window.
+type flowController struct {
 	mutex sync.Mutex
 
-	receiveWindow      uint64
-	maxReceiveWindow   uint64
-	receivedBytes      uint64
-	readBytes          uint64
+	receiveWindow    uint64
+	maxReceiveWindow uint64
+	receivedBytes    uint64
+	readBytes        uint64
 
-	sendWindow         uint64
-	sentBytes          uint64
-	
+	sendWindow uint64
+	sentBytes  uint64
+
 	// wake is closed when the send window is updated.
-	// It is replaced with a new channel after closure.
 	wake chan struct{}
 }
 
-// NewFlowController creates a new flow controller.
-func NewFlowController(initialWindow uint64) *FlowController {
-	return &FlowController{
+// newFlowController creates a new flow controller.
+func newFlowController(initialWindow uint64) *flowController {
+	return &flowController{
 		receiveWindow:    initialWindow,
 		maxReceiveWindow: initialWindow,
 		sendWindow:       initialWindow,
@@ -32,7 +31,7 @@ func NewFlowController(initialWindow uint64) *FlowController {
 }
 
 // UpdateSendWindow updates the send window.
-func (fc *FlowController) UpdateSendWindow(limit uint64) {
+func (fc *flowController) UpdateSendWindow(limit uint64) {
 	fc.mutex.Lock()
 	defer fc.mutex.Unlock()
 	if limit > fc.sendWindow {
@@ -42,19 +41,15 @@ func (fc *FlowController) UpdateSendWindow(limit uint64) {
 	}
 }
 
-// AddSentBytes adds sent bytes and checks if it's within the window.
-func (fc *FlowController) AddSentBytes(n uint64) bool {
+// AddSentBytes adds sent bytes.
+func (fc *flowController) AddSentBytes(n uint64) {
 	fc.mutex.Lock()
 	defer fc.mutex.Unlock()
-	if fc.sentBytes+n > fc.sendWindow {
-		return false
-	}
 	fc.sentBytes += n
-	return true
 }
 
 // SendWindowRemaining returns the remaining send window.
-func (fc *FlowController) SendWindowRemaining() uint64 {
+func (fc *flowController) SendWindowRemaining() uint64 {
 	fc.mutex.Lock()
 	defer fc.mutex.Unlock()
 	if fc.sentBytes >= fc.sendWindow {
@@ -63,15 +58,15 @@ func (fc *FlowController) SendWindowRemaining() uint64 {
 	return fc.sendWindow - fc.sentBytes
 }
 
-// WaitSendWindow returns a channel that is closed when the send window might have increased.
-func (fc *FlowController) WaitSendWindow() <-chan struct{} {
+// WaitSendWindow returns a channel that is closed when the send window is updated.
+func (fc *flowController) WaitSendWindow() <-chan struct{} {
 	fc.mutex.Lock()
 	defer fc.mutex.Unlock()
 	return fc.wake
 }
 
 // AddReceivedBytes adds received bytes and checks if it's within the window.
-func (fc *FlowController) AddReceivedBytes(n uint64) bool {
+func (fc *flowController) AddReceivedBytes(n uint64) bool {
 	fc.mutex.Lock()
 	defer fc.mutex.Unlock()
 	if fc.receivedBytes+n > fc.receiveWindow {
@@ -81,14 +76,16 @@ func (fc *FlowController) AddReceivedBytes(n uint64) bool {
 	return true
 }
 
+const windowUpdateThresholdDenominator = 2
+
 // AddReadBytes adds read bytes and returns whether a window update should be sent.
-func (fc *FlowController) AddReadBytes(n uint64) (bool, uint64) {
+func (fc *flowController) AddReadBytes(n uint64) (bool, uint64) {
 	fc.mutex.Lock()
 	defer fc.mutex.Unlock()
 	fc.readBytes += n
-	
+
 	// Send window update if more than half of the window is consumed.
-	if fc.receiveWindow - fc.readBytes <= fc.maxReceiveWindow / 2 {
+	if fc.receiveWindow-fc.readBytes <= fc.maxReceiveWindow/windowUpdateThresholdDenominator {
 		fc.receiveWindow = fc.readBytes + fc.maxReceiveWindow
 		return true, fc.receiveWindow
 	}
