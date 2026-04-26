@@ -3,27 +3,39 @@ package wire
 import (
 	"bytes"
 	"io"
+	"sync"
+
+	"github.com/quic-go/quic-go/quicvarint"
 )
+
+var bufferPool = sync.Pool{
+	New: func() any {
+		b := new(bytes.Buffer)
+		b.Grow(17000) // Slightly more than default max record size
+		return b
+	},
+}
 
 // RecordReader reads QMux records.
 type RecordReader struct {
-	r io.Reader
+	r quicvarint.Reader
 }
 
 // NewRecordReader creates a new RecordReader.
 func NewRecordReader(r io.Reader) *RecordReader {
-	return &RecordReader{r: r}
+	return &RecordReader{r: quicvarint.NewReader(r)}
 }
 
 // ReadRecord reads the next QMux record and returns the frames.
-func (rr *RecordReader) ReadRecord() ([]Frame, error) {
-	size, err := ReadVarInt(rr.r)
+// It can optionally reuse the given slice to reduce allocations.
+func (rr *RecordReader) ReadRecord(reuse []Frame) ([]Frame, error) {
+	size, err := quicvarint.Read(rr.r)
 	if err != nil {
 		return nil, err
 	}
 
 	lr := &io.LimitedReader{R: rr.r, N: int64(size)}
-	var frames []Frame
+	frames := reuse[:0]
 	for lr.N > 0 {
 		f, err := ParseFrame(lr)
 		if err != nil {
@@ -46,14 +58,40 @@ func NewRecordWriter(w io.Writer) *RecordWriter {
 
 // WriteRecord writes a QMux record containing the given frames.
 func (rw *RecordWriter) WriteRecord(frames ...Frame) error {
-	var buf bytes.Buffer
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
 	for _, f := range frames {
-		if err := f.Write(&buf); err != nil {
+		if err := f.Write(buf); err != nil {
+			bufferPool.Put(buf)
 			return err
 		}
 	}
 
-	if err := WriteVarInt(rw.w, uint64(buf.Len())); err != nil {
+	err := rw.writeBuffer(buf)
+	bufferPool.Put(buf)
+	return err
+}
+
+// WriteRecordSingle writes a QMux record containing a single frame, avoiding variadic allocation.
+func (rw *RecordWriter) WriteRecordSingle(f Frame) error {
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
+	if err := f.Write(buf); err != nil {
+		bufferPool.Put(buf)
+		return err
+	}
+
+	err := rw.writeBuffer(buf)
+	bufferPool.Put(buf)
+	return err
+}
+
+func (rw *RecordWriter) writeBuffer(buf *bytes.Buffer) error {
+	var b [8]byte
+	s := quicvarint.Append(b[:0], uint64(buf.Len()))
+	if _, err := rw.w.Write(s); err != nil {
 		return err
 	}
 	_, err := rw.w.Write(buf.Bytes())

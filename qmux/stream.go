@@ -23,10 +23,6 @@ type receiveSide struct {
 	readDeadline  time.Time
 }
 
-func (r *receiveSide) isClosed() bool {
-	return r.receiveClosed.Load()
-}
-
 type sendSide struct {
 	sendOffset    atomic.Uint64
 	sendClosed    atomic.Bool
@@ -34,10 +30,6 @@ type sendSide struct {
 	sendFC        *flowController
 	writeChan     chan struct{}
 	writeDeadline time.Time
-}
-
-func (s *sendSide) isClosed() bool {
-	return s.sendClosed.Load()
 }
 
 type baseStream struct {
@@ -76,9 +68,9 @@ type ReceiveStream struct {
 	*baseStream
 }
 
-func (s *ReceiveStream) Read(p []byte) (int, error)           { return s.baseStream.read(p) }
+func (s *ReceiveStream) Read(p []byte) (int, error) { return s.baseStream.read(p) }
 func (s *ReceiveStream) CancelRead(code quic.StreamErrorCode) { s.baseStream.cancelRead(code) }
-func (s *ReceiveStream) StreamID() StreamID                   { return s.baseStream.id }
+func (s *ReceiveStream) StreamID() StreamID { return s.baseStream.id }
 func (s *ReceiveStream) SetReadDeadline(t time.Time) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -91,10 +83,10 @@ type SendStream struct {
 	*baseStream
 }
 
-func (s *SendStream) Write(p []byte) (int, error)           { return s.baseStream.write(p) }
-func (s *SendStream) Close() error                          { return s.baseStream.close() }
+func (s *SendStream) Write(p []byte) (int, error) { return s.baseStream.write(p) }
+func (s *SendStream) Close() error { return s.baseStream.close() }
 func (s *SendStream) CancelWrite(code quic.StreamErrorCode) { s.baseStream.cancelWrite(code) }
-func (s *SendStream) StreamID() StreamID                    { return s.baseStream.id }
+func (s *SendStream) StreamID() StreamID { return s.baseStream.id }
 func (s *SendStream) SetWriteDeadline(t time.Time) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -107,13 +99,13 @@ type Stream struct {
 	*baseStream
 }
 
-func (s *Stream) Read(p []byte) (int, error)            { return s.baseStream.read(p) }
-func (s *Stream) Write(p []byte) (int, error)           { return s.baseStream.write(p) }
-func (s *Stream) Close() error                          { return s.baseStream.close() }
-func (s *Stream) CancelRead(code quic.StreamErrorCode)  { s.baseStream.cancelRead(code) }
+func (s *Stream) Read(p []byte) (int, error) { return s.baseStream.read(p) }
+func (s *Stream) Write(p []byte) (int, error) { return s.baseStream.write(p) }
+func (s *Stream) Close() error { return s.baseStream.close() }
+func (s *Stream) CancelRead(code quic.StreamErrorCode) { s.baseStream.cancelRead(code) }
 func (s *Stream) CancelWrite(code quic.StreamErrorCode) { s.baseStream.cancelWrite(code) }
-func (s *Stream) StreamID() StreamID                    { return s.baseStream.id }
-func (s *Stream) Context() context.Context              { return s.baseStream.ctx }
+func (s *Stream) StreamID() StreamID { return s.baseStream.id }
+func (s *Stream) Context() context.Context { return s.baseStream.ctx }
 func (s *Stream) SetDeadline(t time.Time) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -146,7 +138,12 @@ func (s *baseStream) read(p []byte) (n int, err error) {
 		var timeoutChan <-chan time.Time
 		var timer *time.Timer
 		if !s.receive.readDeadline.IsZero() {
-			timer = time.NewTimer(time.Until(s.receive.readDeadline))
+			duration := time.Until(s.receive.readDeadline)
+			if duration <= 0 {
+				s.mutex.Unlock()
+				return 0, errors.New("deadline exceeded")
+			}
+			timer = time.NewTimer(duration)
 			timeoutChan = timer.C
 		}
 
@@ -241,6 +238,7 @@ func (s *baseStream) write(p []byte) (n int, err error) {
 		s.mutex.Lock()
 		window := s.send.sendFC.SendWindowRemaining()
 		connWindow := s.session.connFC.SendWindowRemaining()
+		peerMaxRecord := s.session.peerMaxRecordSize.Load()
 		s.mutex.Unlock()
 
 		if window > connWindow {
@@ -251,7 +249,11 @@ func (s *baseStream) write(p []byte) (n int, err error) {
 			var timeoutChan <-chan time.Time
 			var timer *time.Timer
 			if !s.send.writeDeadline.IsZero() {
-				timer = time.NewTimer(time.Until(s.send.writeDeadline))
+				duration := time.Until(s.send.writeDeadline)
+				if duration <= 0 {
+					return total, errors.New("deadline exceeded")
+				}
+				timer = time.NewTimer(duration)
 				timeoutChan = timer.C
 			}
 
@@ -279,15 +281,25 @@ func (s *baseStream) write(p []byte) (n int, err error) {
 
 		canSend := min(remaining, window)
 
-		data := p[total : total+int(canSend)]
-
-		f := &wire.StreamFrame{
-			StreamID: uint64(s.id),
-			Offset:   s.send.sendOffset.Load(),
-			Data:     data,
+		// Respect peerMaxRecordSize.
+		const maxOverhead = 64
+		if peerMaxRecord > maxOverhead {
+			maxPayload := peerMaxRecord - maxOverhead
+			if canSend > maxPayload {
+				canSend = maxPayload
+			}
 		}
 
+		data := p[total : total+int(canSend)]
+
+		f := wire.GetStreamFrame()
+		f.StreamID = uint64(s.id)
+		f.Offset = s.send.sendOffset.Load()
+		f.Data = data
+		f.Fin = false
+
 		if err := s.session.sendFrame(f); err != nil {
+			f.Recycle()
 			return total, err
 		}
 
@@ -326,19 +338,18 @@ func (s *baseStream) closeWithError(err error) {
 }
 
 func (s *baseStream) close() error {
-	s.mutex.Lock()
 	if s.send.sendClosed.Swap(true) {
-		s.mutex.Unlock()
 		return nil
 	}
 	offset := s.send.sendOffset.Load()
-	s.mutex.Unlock()
 
-	return s.session.sendFrame(&wire.StreamFrame{
-		StreamID: uint64(s.id),
-		Offset:   offset,
-		Fin:      true,
-	})
+	f := wire.GetStreamFrame()
+	f.StreamID = uint64(s.id)
+	f.Offset = offset
+	f.Data = nil
+	f.Fin = true
+
+	return s.session.sendFrame(f)
 }
 
 func (s *baseStream) cancelRead(code quic.StreamErrorCode) {

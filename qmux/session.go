@@ -1,7 +1,7 @@
 package qmux
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -12,6 +12,7 @@ import (
 
 	"github.com/okdaichi/qmux-go/qmux/internal/wire"
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 const (
@@ -98,6 +99,8 @@ type Conn struct {
 	config   *Config
 	isServer bool
 
+	bw *bufio.Writer
+	br *bufio.Reader
 	rr *wire.RecordReader
 	rw *wire.RecordWriter
 
@@ -161,13 +164,21 @@ func newSession(conn net.Conn, config *Config, isServer bool) *Conn {
 		wake:              make(chan struct{}, 1),
 	}
 	s.peerMaxRecordSize.Store(16382) // Spec default
-	s.conn = &byteCountingConn{
+
+	// Wrap the raw connection for statistics
+	bc := &byteCountingConn{
 		Conn:          conn,
 		bytesSent:     &s.bytesSent,
 		bytesReceived: &s.bytesReceived,
 	}
-	s.rr = wire.NewRecordReader(s.conn)
-	s.rw = wire.NewRecordWriter(s.conn)
+	s.conn = bc
+
+	// Use buffered I/O on top of the counting connection
+	s.br = bufio.NewReader(bc)
+	s.bw = bufio.NewWriter(bc)
+
+	s.rr = wire.NewRecordReader(s.br)
+	s.rw = wire.NewRecordWriter(s.bw)
 	s.sm = newStreamManager(config, isServer)
 	s.connFC = newFlowController(config.InitialConnectionReceiveWindow)
 
@@ -208,8 +219,10 @@ func (s *Conn) run() {
 
 	// 2. Read loop
 	firstRecord := true
+	var frames []wire.Frame
 	for {
-		frames, err := s.rr.ReadRecord()
+		var err error
+		frames, err = s.rr.ReadRecord(frames)
 		if err != nil {
 			s.CloseWithError(0, err.Error())
 			return
@@ -288,7 +301,10 @@ func (s *Conn) handleHandshakeParameters(f *wire.TransportParametersFrame) {
 			continue
 		}
 
-		val, _ := wire.ReadVarInt(bytes.NewReader(p.Value))
+		val, _, err := quicvarint.Parse(p.Value)
+		if err != nil {
+			continue
+		}
 		switch p.ID {
 		case wire.TransportParameterInitialMaxData:
 			s.connFC.UpdateSendWindow(val)
@@ -310,10 +326,7 @@ func (s *Conn) handleHandshakeParameters(f *wire.TransportParametersFrame) {
 	}
 
 	if limitsUpdated {
-		s.sm.mutex.Lock()
-		close(s.sm.streamLimitWake)
-		s.sm.streamLimitWake = make(chan struct{})
-		s.sm.mutex.Unlock()
+		s.signalStreamLimit(false)
 	}
 }
 
@@ -363,6 +376,8 @@ func (s *Conn) startBackgroundTasks() {
 }
 
 func (s *Conn) writeLoop() {
+	var frames []wire.Frame
+	var splitBuf []wire.Frame // Reuse for splitting records
 	for {
 		s.queueMutex.Lock()
 		for len(s.controlFrames) == 0 && len(s.streamFrames) == 0 {
@@ -375,45 +390,51 @@ func (s *Conn) writeLoop() {
 			}
 		}
 
-		frames := make([]wire.Frame, 0, len(s.controlFrames)+len(s.streamFrames))
+		frames = frames[:0]
 		frames = append(frames, s.controlFrames...)
 		s.controlFrames = s.controlFrames[:0]
 		frames = append(frames, s.streamFrames...)
 		s.streamFrames = s.streamFrames[:0]
 		s.queueMutex.Unlock()
 
-		if err := s.writeFrames(frames...); err != nil {
+		var err error
+		splitBuf, err = s.writeFrames(splitBuf, frames...)
+		
+		// Recycle frames after sending
+		for _, f := range frames {
+			f.Recycle()
+		}
+		
+		if err != nil {
 			s.CloseWithError(0, err.Error())
 			return
 		}
 	}
 }
 
-func (s *Conn) writeFrames(frames ...wire.Frame) error {
+func (s *Conn) writeFrames(splitBuf []wire.Frame, frames ...wire.Frame) ([]wire.Frame, error) {
 	s.writeMutex.Lock()
 	defer s.writeMutex.Unlock()
 
 	s.mutex.Lock()
 	s.lastFrameTime = time.Now()
+	peerMax := s.peerMaxRecordSize.Load()
 	s.mutex.Unlock()
 
-	peerMax := s.peerMaxRecordSize.Load()
-
-	// Split frames into multiple records if total size exceeds peerMaxRecordSize.
-	// Note: A single frame MUST fit into peerMaxRecordSize.
-	var current []wire.Frame
+	// Use splitBuf for record building to avoid allocations
+	current := splitBuf[:0]
 	var currentSize uint64
 	for _, f := range frames {
 		fLen := f.Length()
 		if fLen > peerMax {
-			return &Error{ErrorCode: ProtocolViolationError, Message: "frame too large for peer record size"}
+			return current, &Error{ErrorCode: ProtocolViolationError, Message: "frame too large for peer record size"}
 		}
 
 		if currentSize+fLen > peerMax && len(current) > 0 {
 			if err := s.sendRecord(current); err != nil {
-				return err
+				return current, err
 			}
-			current = nil
+			current = current[:0]
 			currentSize = 0
 		}
 		current = append(current, f)
@@ -421,9 +442,11 @@ func (s *Conn) writeFrames(frames ...wire.Frame) error {
 	}
 
 	if len(current) > 0 {
-		return s.sendRecord(current)
+		if err := s.sendRecord(current); err != nil {
+			return current, err
+		}
 	}
-	return nil
+	return current, nil
 }
 
 func (s *Conn) sendRecord(frames []wire.Frame) error {
@@ -431,7 +454,15 @@ func (s *Conn) sendRecord(frames []wire.Frame) error {
 
 	// Use a deadline to avoid blocking forever
 	s.conn.SetWriteDeadline(time.Now().Add(defaultWriteDeadline))
-	err := s.rw.WriteRecord(frames...)
+	var err error
+	if len(frames) == 1 {
+		err = s.rw.WriteRecordSingle(frames[0])
+	} else {
+		err = s.rw.WriteRecord(frames...)
+	}
+	if err == nil {
+		err = s.bw.Flush()
+	}
 	s.conn.SetWriteDeadline(time.Time{})
 	return err
 }
@@ -503,7 +534,8 @@ func (s *Conn) SendMessage(p []byte) error {
 		return errors.New("message too large")
 	}
 
-	return s.writeFrames(&wire.DatagramFrame{Data: p})
+	_, err := s.writeFrames(nil, &wire.DatagramFrame{Data: p})
+	return err
 }
 
 // ReceiveMessage receives a datagram message.
@@ -527,16 +559,34 @@ func (s *Conn) ReceiveMessage(ctx context.Context) ([]byte, error) {
 	}
 }
 
+func (s *Conn) signalStreamLimit(closing bool) {
+	s.sm.mutex.Lock()
+	defer s.sm.mutex.Unlock()
+	
+	// Check if already closed
+	select {
+	case <-s.sm.streamLimitWake:
+		if !closing {
+			// Already closed but we want to signal again (recreate)
+			s.sm.streamLimitWake = make(chan struct{})
+		}
+		return
+	default:
+	}
+
+	close(s.sm.streamLimitWake)
+	if !closing {
+		s.sm.streamLimitWake = make(chan struct{})
+	}
+}
+
 func (s *Conn) handleMaxStreamsFrame(f *wire.MaxStreamsFrame) {
 	if f.TypeField == wire.FrameTypeMaxStreamsBi {
 		s.sm.peerMaxBidiStreams.Store(f.MaximumStreams)
 	} else {
 		s.sm.peerMaxUniStreams.Store(f.MaximumStreams)
 	}
-	s.sm.mutex.Lock()
-	close(s.sm.streamLimitWake)
-	s.sm.streamLimitWake = make(chan struct{})
-	s.sm.mutex.Unlock()
+	s.signalStreamLimit(false)
 }
 
 func (s *Conn) handlePingFrame(f *wire.PingFrame) {
@@ -688,7 +738,7 @@ func (s *Conn) CloseWithError(code quic.ApplicationErrorCode, msg string) error 
 	}
 
 	// Direct write for connection close
-	s.writeFrames(&wire.ConnectionCloseFrame{
+	_, _ = s.writeFrames(nil, &wire.ConnectionCloseFrame{
 		TypeField:    wire.FrameTypeApplicationClose,
 		ErrorCode:    uint64(code),
 		ReasonPhrase: msg,
@@ -916,7 +966,5 @@ func (s *Conn) ConnectionState() quic.ConnectionState {
 }
 
 func encodeVarInt(i uint64) []byte {
-	var buf bytes.Buffer
-	wire.WriteVarInt(&buf, i)
-	return buf.Bytes()
+	return quicvarint.Append(nil, i)
 }

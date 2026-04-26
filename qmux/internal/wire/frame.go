@@ -4,6 +4,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
+
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 // FrameType is a QUIC frame type.
@@ -47,11 +50,13 @@ type Frame interface {
 	Type() FrameType
 	Write(io.Writer) error
 	Length() uint64
+	Recycle()
 }
 
 // ParseFrame parses a single frame.
 func ParseFrame(r io.Reader) (Frame, error) {
-	t, err := ReadVarInt(r)
+	qr := quicvarint.NewReader(r)
+	t, err := quicvarint.Read(qr)
 	if err != nil {
 		return nil, err
 	}
@@ -63,53 +68,62 @@ func ParseFrame(r io.Reader) (Frame, error) {
 	case ft == FrameTypePing:
 		return &StandardPingFrame{}, nil
 	case ft == FrameTypeResetStream:
-		return parseResetStreamFrame(r)
+		return parseResetStreamFrame(qr)
 	case ft == FrameTypeStopSending:
-		return parseStopSendingFrame(r)
+		return parseStopSendingFrame(qr)
 	case ft == FrameTypeCrypto || ft == FrameTypeNewToken || ft == FrameTypeNewConnectionID ||
 		ft == FrameTypeRetireConnectionID || ft == FrameTypePathChallenge || ft == FrameTypePathResponse ||
 		ft == FrameTypeHandshakeDone:
 		return nil, fmt.Errorf("prohibited frame type: 0x%x", t)
 	case ft >= FrameTypeStream && ft <= maxStreamFrameType:
-		return parseStreamFrame(r, ft)
+		return parseStreamFrame(qr, ft)
 	case ft == FrameTypeMaxData:
-		return parseMaxDataFrame(r)
+		return parseMaxDataFrame(qr)
 	case ft == FrameTypeMaxStreamData:
-		return parseMaxStreamDataFrame(r)
+		return parseMaxStreamDataFrame(qr)
 	case ft == FrameTypeMaxStreamsBi || ft == FrameTypeMaxStreamsUni:
-		return parseMaxStreamsFrame(r, ft)
+		return parseMaxStreamsFrame(qr, ft)
 	case ft == FrameTypeDataBlocked:
-		return parseDataBlockedFrame(r)
+		return parseDataBlockedFrame(qr)
 	case ft == FrameTypeStreamDataBlocked:
-		return parseStreamDataBlockedFrame(r)
+		return parseStreamDataBlockedFrame(qr)
 	case ft == FrameTypeStreamsBlockedBi || ft == FrameTypeStreamsBlockedUni:
-		return parseStreamsBlockedFrame(r, ft)
+		return parseStreamsBlockedFrame(qr, ft)
 	case ft == FrameTypeConnectionClose || ft == FrameTypeApplicationClose:
-		return parseConnectionCloseFrame(r, ft)
+		return parseConnectionCloseFrame(qr, ft)
 	case ft == FrameTypeDatagram || ft == FrameTypeDatagram+1:
-		return parseDatagramFrame(r, ft)
+		return parseDatagramFrame(qr, ft)
 	case ft == FrameTypeTransportParameters:
-		return parseTransportParametersFrame(r)
+		return parseTransportParametersFrame(qr)
 	case ft == FrameTypePingRequest || ft == FrameTypePingResponse:
-		return parsePingFrame(r, ft)
+		return parsePingFrame(qr, ft)
 	default:
 		return nil, fmt.Errorf("unknown frame type: 0x%x", t)
 	}
+}
+
+func writeVarInt(w io.Writer, i uint64) error {
+	var b [8]byte
+	s := quicvarint.Append(b[:0], i)
+	_, err := w.Write(s)
+	return err
 }
 
 // PaddingFrame is a PADDING frame.
 type PaddingFrame struct{}
 
 func (f *PaddingFrame) Type() FrameType { return FrameTypePadding }
-func (f *PaddingFrame) Write(w io.Writer) error { return WriteVarInt(w, uint64(f.Type())) }
+func (f *PaddingFrame) Write(w io.Writer) error { return writeVarInt(w, uint64(f.Type())) }
 func (f *PaddingFrame) Length() uint64 { return 1 }
+func (f *PaddingFrame) Recycle() {}
 
 // StandardPingFrame is a standard QUIC PING frame.
 type StandardPingFrame struct{}
 
 func (f *StandardPingFrame) Type() FrameType { return FrameTypePing }
-func (f *StandardPingFrame) Write(w io.Writer) error { return WriteVarInt(w, uint64(f.Type())) }
+func (f *StandardPingFrame) Write(w io.Writer) error { return writeVarInt(w, uint64(f.Type())) }
 func (f *StandardPingFrame) Length() uint64 { return 1 }
+func (f *StandardPingFrame) Recycle() {}
 
 // ResetStreamFrame is a RESET_STREAM frame.
 type ResetStreamFrame struct {
@@ -120,31 +134,32 @@ type ResetStreamFrame struct {
 
 func (f *ResetStreamFrame) Type() FrameType { return FrameTypeResetStream }
 func (f *ResetStreamFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
-	if err := WriteVarInt(w, f.StreamID); err != nil {
+	if err := writeVarInt(w, f.StreamID); err != nil {
 		return err
 	}
-	if err := WriteVarInt(w, f.ErrorCode); err != nil {
+	if err := writeVarInt(w, f.ErrorCode); err != nil {
 		return err
 	}
-	return WriteVarInt(w, f.FinalSize)
+	return writeVarInt(w, f.FinalSize)
 }
 func (f *ResetStreamFrame) Length() uint64 {
-	return uint64(VarIntLen(uint64(f.Type())) + VarIntLen(f.StreamID) + VarIntLen(f.ErrorCode) + VarIntLen(f.FinalSize))
+	return uint64(quicvarint.Len(uint64(f.Type())) + quicvarint.Len(f.StreamID) + quicvarint.Len(f.ErrorCode) + quicvarint.Len(f.FinalSize))
 }
+func (f *ResetStreamFrame) Recycle() {}
 
-func parseResetStreamFrame(r io.Reader) (*ResetStreamFrame, error) {
-	sid, err := ReadVarInt(r)
+func parseResetStreamFrame(r quicvarint.Reader) (*ResetStreamFrame, error) {
+	sid, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
-	ec, err := ReadVarInt(r)
+	ec, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
-	fs, err := ReadVarInt(r)
+	fs, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
@@ -159,24 +174,25 @@ type StopSendingFrame struct {
 
 func (f *StopSendingFrame) Type() FrameType { return FrameTypeStopSending }
 func (f *StopSendingFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
-	if err := WriteVarInt(w, f.StreamID); err != nil {
+	if err := writeVarInt(w, f.StreamID); err != nil {
 		return err
 	}
-	return WriteVarInt(w, f.ErrorCode)
+	return writeVarInt(w, f.ErrorCode)
 }
 func (f *StopSendingFrame) Length() uint64 {
-	return uint64(VarIntLen(uint64(f.Type())) + VarIntLen(f.StreamID) + VarIntLen(f.ErrorCode))
+	return uint64(quicvarint.Len(uint64(f.Type())) + quicvarint.Len(f.StreamID) + quicvarint.Len(f.ErrorCode))
 }
+func (f *StopSendingFrame) Recycle() {}
 
-func parseStopSendingFrame(r io.Reader) (*StopSendingFrame, error) {
-	sid, err := ReadVarInt(r)
+func parseStopSendingFrame(r quicvarint.Reader) (*StopSendingFrame, error) {
+	sid, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
-	ec, err := ReadVarInt(r)
+	ec, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
@@ -212,18 +228,18 @@ func (f *StreamFrame) Type() FrameType {
 }
 
 func (f *StreamFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
-	if err := WriteVarInt(w, f.StreamID); err != nil {
+	if err := writeVarInt(w, f.StreamID); err != nil {
 		return err
 	}
 	if f.Offset > 0 {
-		if err := WriteVarInt(w, f.Offset); err != nil {
+		if err := writeVarInt(w, f.Offset); err != nil {
 			return err
 		}
 	}
-	if err := WriteVarInt(w, uint64(len(f.Data))); err != nil {
+	if err := writeVarInt(w, uint64(len(f.Data))); err != nil {
 		return err
 	}
 	_, err := w.Write(f.Data)
@@ -231,30 +247,62 @@ func (f *StreamFrame) Write(w io.Writer) error {
 }
 
 func (f *StreamFrame) Length() uint64 {
-	l := uint64(VarIntLen(uint64(f.Type())) + VarIntLen(f.StreamID))
+	l := uint64(quicvarint.Len(uint64(f.Type())) + quicvarint.Len(f.StreamID))
 	if f.Offset > 0 {
-		l += uint64(VarIntLen(f.Offset))
+		l += uint64(quicvarint.Len(f.Offset))
 	}
-	l += uint64(VarIntLen(uint64(len(f.Data))))
+	l += uint64(quicvarint.Len(uint64(len(f.Data))))
 	l += uint64(len(f.Data))
 	return l
 }
 
-func parseStreamFrame(r io.Reader, ft FrameType) (*StreamFrame, error) {
-	sid, err := ReadVarInt(r)
+var streamFramePool = sync.Pool{
+	New: func() any {
+		return &StreamFrame{}
+	},
+}
+
+var bytePool = sync.Pool{
+	New: func() any {
+		// Default size for records is 16KB
+		b := make([]byte, 16384)
+		return &b
+	},
+}
+
+// GetStreamFrame gets a StreamFrame from the pool.
+func GetStreamFrame() *StreamFrame {
+	return streamFramePool.Get().(*StreamFrame)
+}
+
+// Recycle puts the frame back into the pool if it's a StreamFrame.
+func (f *StreamFrame) Recycle() {
+	if f.Data != nil {
+		// Only recycle if it's exactly our pooled size
+		if cap(f.Data) == 16384 {
+			b := f.Data[:16384]
+			bytePool.Put(&b)
+		}
+		f.Data = nil
+	}
+	streamFramePool.Put(f)
+}
+
+func parseStreamFrame(r quicvarint.Reader, ft FrameType) (*StreamFrame, error) {
+	sid, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
 	var offset uint64
 	if ft&0x04 != 0 {
-		offset, err = ReadVarInt(r)
+		offset, err = quicvarint.Read(r)
 		if err != nil {
 			return nil, err
 		}
 	}
 	var length uint64
 	if ft&0x02 != 0 {
-		length, err = ReadVarInt(r)
+		length, err = quicvarint.Read(r)
 		if err != nil {
 			return nil, err
 		}
@@ -262,17 +310,24 @@ func parseStreamFrame(r io.Reader, ft FrameType) (*StreamFrame, error) {
 		return nil, fmt.Errorf("STREAM frame without LEN bit not yet supported")
 	}
 
-	data := make([]byte, length)
-	if _, err := io.ReadFull(r, data); err != nil {
+	f := GetStreamFrame()
+	f.StreamID = sid
+	f.Offset = offset
+	f.Fin = ft&0x01 != 0
+	
+	if length <= 16384 {
+		pb := bytePool.Get().(*[]byte)
+		f.Data = (*pb)[:length]
+	} else {
+		f.Data = make([]byte, length)
+	}
+
+	if _, err := io.ReadFull(r, f.Data); err != nil {
+		f.Recycle()
 		return nil, err
 	}
 
-	return &StreamFrame{
-		StreamID: sid,
-		Offset:   offset,
-		Data:     data,
-		Fin:      ft&0x01 != 0,
-	}, nil
+	return f, nil
 }
 
 // MaxDataFrame is a MAX_DATA frame.
@@ -282,17 +337,18 @@ type MaxDataFrame struct {
 
 func (f *MaxDataFrame) Type() FrameType { return FrameTypeMaxData }
 func (f *MaxDataFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
-	return WriteVarInt(w, f.MaximumData)
+	return writeVarInt(w, f.MaximumData)
 }
 func (f *MaxDataFrame) Length() uint64 {
-	return uint64(VarIntLen(uint64(f.Type())) + VarIntLen(f.MaximumData))
+	return uint64(quicvarint.Len(uint64(f.Type())) + quicvarint.Len(f.MaximumData))
 }
+func (f *MaxDataFrame) Recycle() {}
 
-func parseMaxDataFrame(r io.Reader) (*MaxDataFrame, error) {
-	md, err := ReadVarInt(r)
+func parseMaxDataFrame(r quicvarint.Reader) (*MaxDataFrame, error) {
+	md, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
@@ -307,24 +363,25 @@ type MaxStreamDataFrame struct {
 
 func (f *MaxStreamDataFrame) Type() FrameType { return FrameTypeMaxStreamData }
 func (f *MaxStreamDataFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
-	if err := WriteVarInt(w, f.StreamID); err != nil {
+	if err := writeVarInt(w, f.StreamID); err != nil {
 		return err
 	}
-	return WriteVarInt(w, f.MaximumStreamData)
+	return writeVarInt(w, f.MaximumStreamData)
 }
 func (f *MaxStreamDataFrame) Length() uint64 {
-	return uint64(VarIntLen(uint64(f.Type())) + VarIntLen(f.StreamID) + VarIntLen(f.MaximumStreamData))
+	return uint64(quicvarint.Len(uint64(f.Type())) + quicvarint.Len(f.StreamID) + quicvarint.Len(f.MaximumStreamData))
 }
+func (f *MaxStreamDataFrame) Recycle() {}
 
-func parseMaxStreamDataFrame(r io.Reader) (*MaxStreamDataFrame, error) {
-	sid, err := ReadVarInt(r)
+func parseMaxStreamDataFrame(r quicvarint.Reader) (*MaxStreamDataFrame, error) {
+	sid, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
-	msd, err := ReadVarInt(r)
+	msd, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
@@ -339,17 +396,18 @@ type MaxStreamsFrame struct {
 
 func (f *MaxStreamsFrame) Type() FrameType { return f.TypeField }
 func (f *MaxStreamsFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
-	return WriteVarInt(w, f.MaximumStreams)
+	return writeVarInt(w, f.MaximumStreams)
 }
 func (f *MaxStreamsFrame) Length() uint64 {
-	return uint64(VarIntLen(uint64(f.Type())) + VarIntLen(f.MaximumStreams))
+	return uint64(quicvarint.Len(uint64(f.Type())) + quicvarint.Len(f.MaximumStreams))
 }
+func (f *MaxStreamsFrame) Recycle() {}
 
-func parseMaxStreamsFrame(r io.Reader, ft FrameType) (*MaxStreamsFrame, error) {
-	ms, err := ReadVarInt(r)
+func parseMaxStreamsFrame(r quicvarint.Reader, ft FrameType) (*MaxStreamsFrame, error) {
+	ms, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
@@ -363,17 +421,18 @@ type DataBlockedFrame struct {
 
 func (f *DataBlockedFrame) Type() FrameType { return FrameTypeDataBlocked }
 func (f *DataBlockedFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
-	return WriteVarInt(w, f.MaximumData)
+	return writeVarInt(w, f.MaximumData)
 }
 func (f *DataBlockedFrame) Length() uint64 {
-	return uint64(VarIntLen(uint64(f.Type())) + VarIntLen(f.MaximumData))
+	return uint64(quicvarint.Len(uint64(f.Type())) + quicvarint.Len(f.MaximumData))
 }
+func (f *DataBlockedFrame) Recycle() {}
 
-func parseDataBlockedFrame(r io.Reader) (*DataBlockedFrame, error) {
-	md, err := ReadVarInt(r)
+func parseDataBlockedFrame(r quicvarint.Reader) (*DataBlockedFrame, error) {
+	md, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
@@ -388,24 +447,25 @@ type StreamDataBlockedFrame struct {
 
 func (f *StreamDataBlockedFrame) Type() FrameType { return FrameTypeStreamDataBlocked }
 func (f *StreamDataBlockedFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
-	if err := WriteVarInt(w, f.StreamID); err != nil {
+	if err := writeVarInt(w, f.StreamID); err != nil {
 		return err
 	}
-	return WriteVarInt(w, f.MaximumStreamData)
+	return writeVarInt(w, f.MaximumStreamData)
 }
 func (f *StreamDataBlockedFrame) Length() uint64 {
-	return uint64(VarIntLen(uint64(f.Type())) + VarIntLen(f.StreamID) + VarIntLen(f.MaximumStreamData))
+	return uint64(quicvarint.Len(uint64(f.Type())) + quicvarint.Len(f.StreamID) + quicvarint.Len(f.MaximumStreamData))
 }
+func (f *StreamDataBlockedFrame) Recycle() {}
 
-func parseStreamDataBlockedFrame(r io.Reader) (*StreamDataBlockedFrame, error) {
-	sid, err := ReadVarInt(r)
+func parseStreamDataBlockedFrame(r quicvarint.Reader) (*StreamDataBlockedFrame, error) {
+	sid, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
-	msd, err := ReadVarInt(r)
+	msd, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
@@ -420,17 +480,18 @@ type StreamsBlockedFrame struct {
 
 func (f *StreamsBlockedFrame) Type() FrameType { return f.TypeField }
 func (f *StreamsBlockedFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
-	return WriteVarInt(w, f.MaximumStreams)
+	return writeVarInt(w, f.MaximumStreams)
 }
 func (f *StreamsBlockedFrame) Length() uint64 {
-	return uint64(VarIntLen(uint64(f.Type())) + VarIntLen(f.MaximumStreams))
+	return uint64(quicvarint.Len(uint64(f.Type())) + quicvarint.Len(f.MaximumStreams))
 }
+func (f *StreamsBlockedFrame) Recycle() {}
 
-func parseStreamsBlockedFrame(r io.Reader, ft FrameType) (*StreamsBlockedFrame, error) {
-	ms, err := ReadVarInt(r)
+func parseStreamsBlockedFrame(r quicvarint.Reader, ft FrameType) (*StreamsBlockedFrame, error) {
+	ms, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
@@ -447,46 +508,47 @@ type ConnectionCloseFrame struct {
 
 func (f *ConnectionCloseFrame) Type() FrameType { return f.TypeField }
 func (f *ConnectionCloseFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
-	if err := WriteVarInt(w, f.ErrorCode); err != nil {
+	if err := writeVarInt(w, f.ErrorCode); err != nil {
 		return err
 	}
 	if f.TypeField == FrameTypeConnectionClose {
-		if err := WriteVarInt(w, f.FrameType); err != nil {
+		if err := writeVarInt(w, f.FrameType); err != nil {
 			return err
 		}
 	}
-	if err := WriteVarInt(w, uint64(len(f.ReasonPhrase))); err != nil {
+	if err := writeVarInt(w, uint64(len(f.ReasonPhrase))); err != nil {
 		return err
 	}
 	_, err := w.Write([]byte(f.ReasonPhrase))
 	return err
 }
 func (f *ConnectionCloseFrame) Length() uint64 {
-	l := uint64(VarIntLen(uint64(f.Type())) + VarIntLen(f.ErrorCode))
+	l := uint64(quicvarint.Len(uint64(f.Type())) + quicvarint.Len(f.ErrorCode))
 	if f.TypeField == FrameTypeConnectionClose {
-		l += uint64(VarIntLen(f.FrameType))
+		l += uint64(quicvarint.Len(f.FrameType))
 	}
-	l += uint64(VarIntLen(uint64(len(f.ReasonPhrase))))
+	l += uint64(quicvarint.Len(uint64(len(f.ReasonPhrase))))
 	l += uint64(len(f.ReasonPhrase))
 	return l
 }
+func (f *ConnectionCloseFrame) Recycle() {}
 
-func parseConnectionCloseFrame(r io.Reader, ft FrameType) (*ConnectionCloseFrame, error) {
-	ec, err := ReadVarInt(r)
+func parseConnectionCloseFrame(r quicvarint.Reader, ft FrameType) (*ConnectionCloseFrame, error) {
+	ec, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
 	var frameType uint64
 	if ft == FrameTypeConnectionClose {
-		frameType, err = ReadVarInt(r)
+		frameType, err = quicvarint.Read(r)
 		if err != nil {
 			return nil, err
 		}
 	}
-	reasonLen, err := ReadVarInt(r)
+	reasonLen, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
@@ -509,7 +571,7 @@ type TransportParametersFrame struct {
 
 func (f *TransportParametersFrame) Type() FrameType { return FrameTypeTransportParameters }
 func (f *TransportParametersFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
 	return WriteTransportParameters(w, f.Parameters)
@@ -517,14 +579,15 @@ func (f *TransportParametersFrame) Write(w io.Writer) error {
 func (f *TransportParametersFrame) Length() uint64 {
 	l := uint64(8) // QX_TRANSPORT_PARAMETERS type is 8 bytes
 	for _, p := range f.Parameters {
-		l += uint64(VarIntLen(p.ID))
-		l += uint64(VarIntLen(uint64(len(p.Value))))
+		l += uint64(quicvarint.Len(p.ID))
+		l += uint64(quicvarint.Len(uint64(len(p.Value))))
 		l += uint64(len(p.Value))
 	}
 	return l
 }
+func (f *TransportParametersFrame) Recycle() {}
 
-func parseTransportParametersFrame(r io.Reader) (*TransportParametersFrame, error) {
+func parseTransportParametersFrame(r quicvarint.Reader) (*TransportParametersFrame, error) {
 	params, err := ParseTransportParameters(r)
 	if err != nil {
 		return nil, err
@@ -540,7 +603,7 @@ type PingFrame struct {
 
 func (f *PingFrame) Type() FrameType { return f.TypeField }
 func (f *PingFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
 	var b [8]byte
@@ -551,8 +614,9 @@ func (f *PingFrame) Write(w io.Writer) error {
 func (f *PingFrame) Length() uint64 {
 	return 8 + 8
 }
+func (f *PingFrame) Recycle() {}
 
-func parsePingFrame(r io.Reader, ft FrameType) (*PingFrame, error) {
+func parsePingFrame(r quicvarint.Reader, ft FrameType) (*PingFrame, error) {
 	var b [8]byte
 	if _, err := io.ReadFull(r, b[:]); err != nil {
 		return nil, err
@@ -570,21 +634,22 @@ type DatagramFrame struct {
 
 func (f *DatagramFrame) Type() FrameType { return FrameTypeDatagram }
 func (f *DatagramFrame) Write(w io.Writer) error {
-	if err := WriteVarInt(w, uint64(f.Type())); err != nil {
+	if err := writeVarInt(w, uint64(f.Type())); err != nil {
 		return err
 	}
-	if err := WriteVarInt(w, uint64(len(f.Data))); err != nil {
+	if err := writeVarInt(w, uint64(len(f.Data))); err != nil {
 		return err
 	}
 	_, err := w.Write(f.Data)
 	return err
 }
 func (f *DatagramFrame) Length() uint64 {
-	return uint64(VarIntLen(uint64(f.Type())) + VarIntLen(uint64(len(f.Data))) + len(f.Data))
+	return uint64(quicvarint.Len(uint64(f.Type())) + quicvarint.Len(uint64(len(f.Data))) + len(f.Data))
 }
+func (f *DatagramFrame) Recycle() {}
 
-func parseDatagramFrame(r io.Reader, ft FrameType) (*DatagramFrame, error) {
-	length, err := ReadVarInt(r)
+func parseDatagramFrame(r quicvarint.Reader, ft FrameType) (*DatagramFrame, error) {
+	length, err := quicvarint.Read(r)
 	if err != nil {
 		return nil, err
 	}
