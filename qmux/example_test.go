@@ -49,7 +49,7 @@ func ExampleConn_ConnectionStats() {
 	fmt.Printf("Smoothed RTT: %v\n", stats.SmoothedRTT)
 }
 
-func ExampleNewNetConn() {
+func ExampleNetConn() {
 	// Adapt a hypothetical message-based transport to net.Conn
 	type myMessageConn struct { /* ... */ }
 	// func (c *myMessageConn) ReadMessage() ([]byte, error) { ... }
@@ -59,7 +59,7 @@ func ExampleNewNetConn() {
 	var mc qmux.MessageConn // = &myMessageConn{}
 	
 	// Wrap it!
-	nc := qmux.NewNetConn(mc)
+	nc := qmux.NetConn(mc)
 	
 	// Now use it with QMux or any other net.Conn consumer
 	sess, _ := qmux.Dial(nc, nil)

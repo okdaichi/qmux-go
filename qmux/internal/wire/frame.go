@@ -1,11 +1,13 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"sync"
 
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
 )
 
@@ -74,7 +76,7 @@ func ParseFrame(r io.Reader) (Frame, error) {
 	case ft == FrameTypeCrypto || ft == FrameTypeNewToken || ft == FrameTypeNewConnectionID ||
 		ft == FrameTypeRetireConnectionID || ft == FrameTypePathChallenge || ft == FrameTypePathResponse ||
 		ft == FrameTypeHandshakeDone:
-		return nil, fmt.Errorf("prohibited frame type: 0x%x", t)
+		return nil, &quic.TransportError{ErrorCode: quic.ProtocolViolation, ErrorMessage: fmt.Sprintf("prohibited frame type: 0x%x", t)}
 	case ft >= FrameTypeStream && ft <= maxStreamFrameType:
 		return parseStreamFrame(qr, ft)
 	case ft == FrameTypeMaxData:
@@ -98,11 +100,17 @@ func ParseFrame(r io.Reader) (Frame, error) {
 	case ft == FrameTypePingRequest || ft == FrameTypePingResponse:
 		return parsePingFrame(qr, ft)
 	default:
-		return nil, fmt.Errorf("unknown frame type: 0x%x", t)
+		return nil, &quic.TransportError{ErrorCode: quic.ProtocolViolation, ErrorMessage: fmt.Sprintf("unknown frame type: 0x%x", t)}
 	}
 }
 
 func writeVarInt(w io.Writer, i uint64) error {
+	if buf, ok := w.(*bytes.Buffer); ok {
+		b := buf.AvailableBuffer()
+		b = quicvarint.Append(b, i)
+		_, err := buf.Write(b)
+		return err
+	}
 	var b [8]byte
 	s := quicvarint.Append(b[:0], i)
 	_, err := w.Write(s)
@@ -307,7 +315,7 @@ func parseStreamFrame(r quicvarint.Reader, ft FrameType) (*StreamFrame, error) {
 			return nil, err
 		}
 	} else {
-		return nil, fmt.Errorf("STREAM frame without LEN bit not yet supported")
+		return nil, &quic.TransportError{ErrorCode: quic.ProtocolViolation, ErrorMessage: "STREAM frame without LEN bit not yet supported"}
 	}
 
 	f := GetStreamFrame()

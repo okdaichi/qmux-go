@@ -38,7 +38,7 @@ map its records directly to WebSocket messages:
 	func (a *wsAdapter) ReadMessage() ([]byte, error) { _, p, err := a.ReadMessage(); return p, err }
 	func (a *wsAdapter) WriteMessage(p []byte) error  { return a.WriteMessage(websocket.BinaryMessage, p) }
 
-	nc := qmux.NewNetConn(&wsAdapter{conn})
+	nc := qmux.NetConn(&wsAdapter{conn})
 	sess, _ := qmux.Dial(nc, nil)
 
 # Protocol Negotiation

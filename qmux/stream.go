@@ -374,15 +374,16 @@ func (s *baseStream) handleStreamFrame(f *wire.StreamFrame) error {
 	defer s.mutex.Unlock()
 
 	if f.Offset != s.receive.receiveOffset.Load() {
-		return &Error{ErrorCode: ProtocolViolationError, Message: "out of order STREAM frame"}
+		return &quic.TransportError{ErrorCode: ProtocolViolationError, ErrorMessage: "out of order STREAM frame"}
 	}
 
 	if !s.receive.receiveFC.AddReceivedBytes(uint64(len(f.Data))) {
-		return &Error{ErrorCode: FlowControlError, Message: "stream flow control violation"}
+		return &quic.TransportError{ErrorCode: FlowControlError, ErrorMessage: "stream flow control violation"}
 	}
 	if !s.session.connFC.AddReceivedBytes(uint64(len(f.Data))) {
-		return &Error{ErrorCode: FlowControlError, Message: "connection flow control violation"}
+		return &quic.TransportError{ErrorCode: FlowControlError, ErrorMessage: "connection flow control violation"}
 	}
+
 
 	s.receive.readBuffer.Write(f.Data)
 	s.receive.receiveOffset.Add(uint64(len(f.Data)))

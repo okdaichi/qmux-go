@@ -1,8 +1,6 @@
 package qmux
 
 import (
-	"fmt"
-
 	"github.com/quic-go/quic-go"
 )
 
@@ -31,16 +29,3 @@ const (
 	AEADLimitReached          TransportErrorCode = 0x0f
 	NoViablePath              TransportErrorCode = 0x10
 )
-
-// Error is an error returned by QMux operations.
-type Error struct {
-	ErrorCode TransportErrorCode
-	Message   string
-}
-
-func (e *Error) Error() string {
-	if e.Message != "" {
-		return fmt.Sprintf("%s: %s", e.ErrorCode.String(), e.Message)
-	}
-	return e.ErrorCode.String()
-}

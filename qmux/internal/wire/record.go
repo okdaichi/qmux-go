@@ -48,12 +48,12 @@ func (rr *RecordReader) ReadRecord(reuse []Frame) ([]Frame, error) {
 
 // RecordWriter writes QMux records.
 type RecordWriter struct {
-	w io.Writer
+	w quicvarint.Writer
 }
 
 // NewRecordWriter creates a new RecordWriter.
 func NewRecordWriter(w io.Writer) *RecordWriter {
-	return &RecordWriter{w: w}
+	return &RecordWriter{w: quicvarint.NewWriter(w)}
 }
 
 // WriteRecord writes a QMux record containing the given frames.
@@ -89,8 +89,8 @@ func (rw *RecordWriter) WriteRecordSingle(f Frame) error {
 }
 
 func (rw *RecordWriter) writeBuffer(buf *bytes.Buffer) error {
-	var b [8]byte
-	s := quicvarint.Append(b[:0], uint64(buf.Len()))
+	var header [8]byte
+	s := quicvarint.Append(header[:0], uint64(buf.Len()))
 	if _, err := rw.w.Write(s); err != nil {
 		return err
 	}

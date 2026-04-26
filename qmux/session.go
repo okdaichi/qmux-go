@@ -121,7 +121,7 @@ type Conn struct {
 	peerMaxRecordSize atomic.Uint64
 
 	peerMaxDatagramFrameSize atomic.Uint64
-	incomingDatagrams        chan []byte
+	receivedDatagrams        chan []byte
 
 	negotiatedProtocol string
 
@@ -160,7 +160,7 @@ func newSession(conn net.Conn, config *Config, isServer bool) *Conn {
 		cancelCtx:         cancel,
 		handshakeDone:     make(chan struct{}),
 		lastFrameTime:     time.Now(),
-		incomingDatagrams: make(chan []byte, 100),
+		receivedDatagrams: make(chan []byte, 100),
 		wake:              make(chan struct{}, 1),
 	}
 	s.peerMaxRecordSize.Store(16382) // Spec default
@@ -427,7 +427,7 @@ func (s *Conn) writeFrames(splitBuf []wire.Frame, frames ...wire.Frame) ([]wire.
 	for _, f := range frames {
 		fLen := f.Length()
 		if fLen > peerMax {
-			return current, &Error{ErrorCode: ProtocolViolationError, Message: "frame too large for peer record size"}
+			return current, &quic.TransportError{ErrorCode: ProtocolViolationError, ErrorMessage: "frame too large for peer record size"}
 		}
 
 		if currentSize+fLen > peerMax && len(current) > 0 {
@@ -496,7 +496,7 @@ func (s *Conn) handleFrame(f wire.Frame) error {
 		}
 		str.send.sendFC.UpdateSendWindow(ff.MaximumStreamData)
 	case *wire.TransportParametersFrame:
-		return &Error{ErrorCode: ProtocolViolationError, Message: "duplicate QX_TRANSPORT_PARAMETERS"}
+		return &quic.TransportError{ErrorCode: ProtocolViolationError, ErrorMessage: "duplicate QX_TRANSPORT_PARAMETERS"}
 	case *wire.MaxStreamsFrame:
 		s.handleMaxStreamsFrame(ff)
 	case *wire.StreamsBlockedFrame:
@@ -517,14 +517,14 @@ func (s *Conn) handleFrame(f wire.Frame) error {
 
 func (s *Conn) handleDatagramFrame(f *wire.DatagramFrame) {
 	select {
-	case s.incomingDatagrams <- f.Data:
+	case s.receivedDatagrams <- f.Data:
 	default:
 		// Drop datagram if queue is full as per RFC 9221
 	}
 }
 
-// SendMessage sends a datagram message.
-func (s *Conn) SendMessage(p []byte) error {
+// SendDatagram sends a datagram message.
+func (s *Conn) SendDatagram(p []byte) error {
 	if !s.config.EnableDatagrams {
 		return errors.New("datagrams not enabled")
 	}
@@ -538,13 +538,13 @@ func (s *Conn) SendMessage(p []byte) error {
 	return err
 }
 
-// ReceiveMessage receives a datagram message.
-func (s *Conn) ReceiveMessage(ctx context.Context) ([]byte, error) {
+// ReceiveDatagram receives a datagram message.
+func (s *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	if !s.config.EnableDatagrams {
 		return nil, errors.New("datagrams not enabled")
 	}
 	select {
-	case msg := <-s.incomingDatagrams:
+	case msg := <-s.receivedDatagrams:
 		return msg, nil
 	case <-s.ctx.Done():
 		s.mutex.Lock()
@@ -671,13 +671,13 @@ func (s *Conn) getOrCreateBaseStream(id StreamID) (*baseStream, error) {
 		select {
 		case s.sm.incomingBidi <- &Stream{baseStream: str}:
 		default:
-			return nil, &Error{ErrorCode: StreamLimitError, Message: "too many concurrent streams"}
+			return nil, &quic.TransportError{ErrorCode: StreamLimitError, ErrorMessage: "too many concurrent streams"}
 		}
 	} else {
 		select {
 		case s.sm.incomingUni <- &ReceiveStream{baseStream: str}:
 		default:
-			return nil, &Error{ErrorCode: StreamLimitError, Message: "too many concurrent uni streams"}
+			return nil, &quic.TransportError{ErrorCode: StreamLimitError, ErrorMessage: "too many concurrent uni streams"}
 		}
 	}
 	return str, nil

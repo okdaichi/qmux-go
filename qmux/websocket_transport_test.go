@@ -106,7 +106,7 @@ func TestGorillaWebSocketTransport(t *testing.T) {
 		defer c.Close()
 
 		// Use the generic adapter
-		nc := NewNetConn(&gorillaAdapter{Conn: c})
+		nc := NetConn(&gorillaAdapter{Conn: c})
 		qServer, err := Server(nc, nil)
 		if err != nil {
 			return
@@ -134,7 +134,7 @@ func TestGorillaWebSocketTransport(t *testing.T) {
 	defer c.Close()
 
 	// Use the generic adapter
-	ncClient := NewNetConn(&gorillaAdapter{Conn: c})
+	ncClient := NetConn(&gorillaAdapter{Conn: c})
 	qClient, err := Dial(ncClient, nil)
 	require.NoError(t, err)
 	defer qClient.Close()
