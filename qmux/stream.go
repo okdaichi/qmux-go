@@ -69,7 +69,7 @@ type ReceiveStream struct {
 }
 
 func (s *ReceiveStream) Read(p []byte) (int, error) { return s.baseStream.read(p) }
-func (s *ReceiveStream) CancelRead(code quic.StreamErrorCode) { s.baseStream.cancelRead(code) }
+func (s *ReceiveStream) CancelRead(code StreamErrorCode) { s.baseStream.cancelRead(code) }
 func (s *ReceiveStream) StreamID() StreamID { return s.baseStream.id }
 func (s *ReceiveStream) SetReadDeadline(t time.Time) error {
 	s.mutex.Lock()
@@ -85,7 +85,7 @@ type SendStream struct {
 
 func (s *SendStream) Write(p []byte) (int, error) { return s.baseStream.write(p) }
 func (s *SendStream) Close() error { return s.baseStream.close() }
-func (s *SendStream) CancelWrite(code quic.StreamErrorCode) { s.baseStream.cancelWrite(code) }
+func (s *SendStream) CancelWrite(code StreamErrorCode) { s.baseStream.cancelWrite(code) }
 func (s *SendStream) StreamID() StreamID { return s.baseStream.id }
 func (s *SendStream) SetWriteDeadline(t time.Time) error {
 	s.mutex.Lock()
@@ -102,8 +102,8 @@ type Stream struct {
 func (s *Stream) Read(p []byte) (int, error) { return s.baseStream.read(p) }
 func (s *Stream) Write(p []byte) (int, error) { return s.baseStream.write(p) }
 func (s *Stream) Close() error { return s.baseStream.close() }
-func (s *Stream) CancelRead(code quic.StreamErrorCode) { s.baseStream.cancelRead(code) }
-func (s *Stream) CancelWrite(code quic.StreamErrorCode) { s.baseStream.cancelWrite(code) }
+func (s *Stream) CancelRead(code StreamErrorCode) { s.baseStream.cancelRead(code) }
+func (s *Stream) CancelWrite(code StreamErrorCode) { s.baseStream.cancelWrite(code) }
 func (s *Stream) StreamID() StreamID { return s.baseStream.id }
 func (s *Stream) Context() context.Context { return s.baseStream.ctx }
 func (s *Stream) SetDeadline(t time.Time) error {
@@ -352,14 +352,14 @@ func (s *baseStream) close() error {
 	return s.session.sendFrame(f)
 }
 
-func (s *baseStream) cancelRead(code quic.StreamErrorCode) {
+func (s *baseStream) cancelRead(code StreamErrorCode) {
 	s.session.queueControlFrame(&wire.StopSendingFrame{
 		StreamID:  uint64(s.id),
 		ErrorCode: uint64(code),
 	})
 }
 
-func (s *baseStream) cancelWrite(code quic.StreamErrorCode) {
+func (s *baseStream) cancelWrite(code StreamErrorCode) {
 	offset := s.send.sendOffset.Load()
 
 	s.session.queueControlFrame(&wire.ResetStreamFrame{
@@ -406,7 +406,7 @@ func (s *baseStream) handleResetStreamFrame(f *wire.ResetStreamFrame) {
 	if s.receive.receiveClosed.Swap(true) {
 		return
 	}
-	s.receive.receiveError = &quic.StreamError{StreamID: s.id, ErrorCode: quic.StreamErrorCode(f.ErrorCode)}
+	s.receive.receiveError = &quic.StreamError{StreamID: s.id, ErrorCode: StreamErrorCode(f.ErrorCode)}
 
 	// Unblock Read
 	select {
@@ -426,7 +426,7 @@ func (s *baseStream) handleStopSendingFrame(f *wire.StopSendingFrame) {
 		s.mutex.Unlock()
 		return
 	}
-	s.send.sendError = &quic.StreamError{StreamID: s.id, ErrorCode: quic.StreamErrorCode(f.ErrorCode)}
+	s.send.sendError = &quic.StreamError{StreamID: s.id, ErrorCode: StreamErrorCode(f.ErrorCode)}
 	offset := s.send.sendOffset.Load()
 	s.mutex.Unlock()
 

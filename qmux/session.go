@@ -213,7 +213,7 @@ func (s *Conn) run() {
 
 	// 1. Send our parameters
 	if err := s.sendTransportParameters(); err != nil {
-		s.CloseWithError(quic.ApplicationErrorCode(InternalError), err.Error())
+		s.CloseWithError(ApplicationErrorCode(InternalError), err.Error())
 		return
 	}
 
@@ -236,12 +236,12 @@ func (s *Conn) run() {
 
 		if firstRecord {
 			if len(frames) == 0 {
-				s.CloseWithError(quic.ApplicationErrorCode(TransportParameterError), "empty initial record")
+				s.CloseWithError(ApplicationErrorCode(TransportParameterError), "empty initial record")
 				return
 			}
 			f, ok := frames[0].(*wire.TransportParametersFrame)
 			if !ok {
-				s.CloseWithError(quic.ApplicationErrorCode(TransportParameterError), "first frame is not QX_TRANSPORT_PARAMETERS")
+				s.CloseWithError(ApplicationErrorCode(TransportParameterError), "first frame is not QX_TRANSPORT_PARAMETERS")
 				return
 			}
 			s.handleHandshakeParameters(f)
@@ -364,7 +364,7 @@ func (s *Conn) startBackgroundTasks() {
 					last := s.lastFrameTime
 					s.mutex.Unlock()
 					if time.Since(last) > idleTimeout {
-						s.CloseWithError(quic.ApplicationErrorCode(InternalError), "idle timeout")
+						s.CloseWithError(ApplicationErrorCode(InternalError), "idle timeout")
 						return
 					}
 				case <-s.ctx.Done():
@@ -510,7 +510,7 @@ func (s *Conn) handleFrame(f wire.Frame) error {
 	case *wire.DatagramFrame:
 		s.handleDatagramFrame(ff)
 	case *wire.ConnectionCloseFrame:
-		return &quic.ApplicationError{ErrorCode: quic.ApplicationErrorCode(ff.ErrorCode), ErrorMessage: ff.ReasonPhrase}
+		return &quic.ApplicationError{ErrorCode: ApplicationErrorCode(ff.ErrorCode), ErrorMessage: ff.ReasonPhrase}
 	}
 	return nil
 }
@@ -715,7 +715,7 @@ func (s *Conn) Close() error {
 }
 
 // CloseWithError closes the connection with an error code and a reason phrase.
-func (s *Conn) CloseWithError(code quic.ApplicationErrorCode, msg string) error {
+func (s *Conn) CloseWithError(code ApplicationErrorCode, msg string) error {
 	s.mutex.Lock()
 	if s.closeErr != nil {
 		s.mutex.Unlock()

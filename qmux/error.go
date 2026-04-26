@@ -10,8 +10,16 @@ type TransportErrorCode = quic.TransportErrorCode
 // ApplicationErrorCode is a QUIC application error code.
 type ApplicationErrorCode = quic.ApplicationErrorCode
 
+// StreamErrorCode is a QUIC stream error code.
+type StreamErrorCode = quic.StreamErrorCode
+
 const (
-	NoError                   TransportErrorCode = 0x00
+	// NoError is a QUIC transport error code.
+	NoError = quic.NoError
+	
+	// ProtocolViolation is a QUIC transport error code.
+	// Since quic-go doesn't export the constant name but uses the type, 
+	// we keep our own definitions for standard QUIC error codes used by QMux.
 	InternalError             TransportErrorCode = 0x01
 	ConnectionRefused         TransportErrorCode = 0x02
 	FlowControlError          TransportErrorCode = 0x03

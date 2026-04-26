@@ -30,7 +30,7 @@ func TestStream_Cancel(t *testing.T) {
 				require.Error(t, err)
 				var streamErr *quic.StreamError
 				require.ErrorAs(t, err, &streamErr)
-				assert.Equal(t, quic.StreamErrorCode(0x42), streamErr.ErrorCode)
+				assert.Equal(t, StreamErrorCode(0x42), streamErr.ErrorCode)
 			},
 		},
 		"CancelRead": {
@@ -50,7 +50,7 @@ func TestStream_Cancel(t *testing.T) {
 				require.Error(t, err)
 				var streamErr *quic.StreamError
 				require.ErrorAs(t, err, &streamErr)
-				assert.Equal(t, quic.StreamErrorCode(0x43), streamErr.ErrorCode)
+				assert.Equal(t, StreamErrorCode(0x43), streamErr.ErrorCode)
 			},
 		},
 	}

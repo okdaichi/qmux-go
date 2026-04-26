@@ -105,7 +105,7 @@ func TestCloseWithError(t *testing.T) {
 
 	var appErr *quic.ApplicationError
 	require.ErrorAs(t, err, &appErr)
-	assert.Equal(t, quic.ApplicationErrorCode(0x1234), appErr.ErrorCode)
+	assert.Equal(t, ApplicationErrorCode(0x1234), appErr.ErrorCode)
 	assert.Equal(t, "goodbye", appErr.ErrorMessage)
 
 	_, err = strClient.Write([]byte("denied"))
