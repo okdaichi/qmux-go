@@ -18,7 +18,8 @@ const (
 	TransportParameterInitialMaxStreamDataUni        uint64 = 0x07
 	TransportParameterInitialMaxStreamsBidi          uint64 = 0x08
 	TransportParameterInitialMaxStreamsUni           uint64 = 0x09
-	TransportParameterMaxRecordSize                  uint64 = 0x0571c59429cd0845
+	TransportParameterMaxRecordSize                  uint64 = 0x3f5153300d0a0d0a
+	TransportParameterMaxDatagramFrameSize           uint64 = 0x20
 )
 
 // ParseTransportParameters parses transport parameters from a reader.

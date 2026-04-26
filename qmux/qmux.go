@@ -38,6 +38,10 @@ type Config struct {
 	KeepAlivePeriod time.Duration
 	// MaxIdleTimeout is the maximum idle time before the connection is closed.
 	MaxIdleTimeout time.Duration
+	// EnableDatagrams enables the unreliable datagram extension.
+	EnableDatagrams bool
+	// MaxDatagramFrameSize is the maximum size of a DATAGRAM frame.
+	MaxDatagramFrameSize uint64
 }
 
 // DefaultConfig returns the default configuration.
@@ -47,7 +51,9 @@ func DefaultConfig() *Config {
 		MaxIncomingUniStreams:          defaultMaxIncomingUniStreams,
 		InitialStreamReceiveWindow:     defaultInitialStreamWindow,
 		InitialConnectionReceiveWindow: defaultInitialConnectionWindow,
+		MaxRecordSize:                  16382,
 		MaxIdleTimeout:                 30 * time.Second,
+		MaxDatagramFrameSize:           1200,
 	}
 }
 

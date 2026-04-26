@@ -81,9 +81,13 @@ type Conn struct {
 	handshakeDone chan struct{}
 	closeErr      error
 
-	mutex         sync.Mutex
-	lastFrameTime time.Time
-	idleTimeout   time.Duration
+	mutex             sync.Mutex
+	lastFrameTime     time.Time
+	idleTimeout       time.Duration
+	peerMaxRecordSize uint64
+
+	peerMaxDatagramFrameSize uint64
+	incomingDatagrams        chan []byte
 
 	// Frame queues
 	queueMutex    sync.Mutex
@@ -100,18 +104,20 @@ func newSession(conn net.Conn, config *Config, isServer bool) *Conn {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Conn{
-		conn:          conn,
-		config:        config,
-		isServer:      isServer,
-		rr:            wire.NewRecordReader(conn),
-		rw:            wire.NewRecordWriter(conn),
-		ctx:           ctx,
-		cancelCtx:     cancel,
-		sm:            newStreamManager(config, isServer),
-		connFC:        newFlowController(config.InitialConnectionReceiveWindow),
-		handshakeDone: make(chan struct{}),
-		lastFrameTime: time.Now(),
-		wake:          make(chan struct{}, 1),
+		conn:              conn,
+		config:            config,
+		isServer:          isServer,
+		rr:                wire.NewRecordReader(conn),
+		rw:                wire.NewRecordWriter(conn),
+		ctx:               ctx,
+		cancelCtx:         cancel,
+		sm:                newStreamManager(config, isServer),
+		connFC:            newFlowController(config.InitialConnectionReceiveWindow),
+		handshakeDone:     make(chan struct{}),
+		lastFrameTime:     time.Now(),
+		peerMaxRecordSize: 16382, // Spec default
+		incomingDatagrams: make(chan []byte, 100),
+		wake:              make(chan struct{}, 1),
 	}
 
 	// Drain goroutine to prevent handleFrame from blocking if session is closed
@@ -197,6 +203,8 @@ func (s *Conn) sendTransportParameters() error {
 	params := []wire.TransportParameter{
 		{ID: wire.TransportParameterInitialMaxData, Value: encodeVarInt(s.config.InitialConnectionReceiveWindow)},
 		{ID: wire.TransportParameterInitialMaxStreamDataBidiLocal, Value: encodeVarInt(s.config.InitialStreamReceiveWindow)},
+		{ID: wire.TransportParameterInitialMaxStreamDataBidiRemote, Value: encodeVarInt(s.config.InitialStreamReceiveWindow)},
+		{ID: wire.TransportParameterInitialMaxStreamDataUni, Value: encodeVarInt(s.config.InitialStreamReceiveWindow)},
 		{ID: wire.TransportParameterInitialMaxStreamsBidi, Value: encodeVarInt(uint64(s.config.MaxIncomingStreams))},
 		{ID: wire.TransportParameterInitialMaxStreamsUni, Value: encodeVarInt(uint64(s.config.MaxIncomingUniStreams))},
 	}
@@ -205,6 +213,9 @@ func (s *Conn) sendTransportParameters() error {
 	}
 	if s.config.MaxIdleTimeout > 0 {
 		params = append(params, wire.TransportParameter{ID: wire.TransportParameterMaxIdleTimeout, Value: encodeVarInt(uint64(s.config.MaxIdleTimeout / time.Millisecond))})
+	}
+	if s.config.EnableDatagrams {
+		params = append(params, wire.TransportParameter{ID: wire.TransportParameterMaxDatagramFrameSize, Value: encodeVarInt(s.config.MaxDatagramFrameSize)})
 	}
 	s.queueControlFrame(&wire.TransportParametersFrame{Parameters: params})
 	return nil
@@ -230,6 +241,14 @@ func (s *Conn) handleHandshakeParameters(f *wire.TransportParametersFrame) {
 		case wire.TransportParameterMaxIdleTimeout:
 			s.mutex.Lock()
 			s.idleTimeout = time.Duration(val) * time.Millisecond
+			s.mutex.Unlock()
+		case wire.TransportParameterMaxRecordSize:
+			s.mutex.Lock()
+			s.peerMaxRecordSize = val
+			s.mutex.Unlock()
+		case wire.TransportParameterMaxDatagramFrameSize:
+			s.mutex.Lock()
+			s.peerMaxDatagramFrameSize = val
 			s.mutex.Unlock()
 		}
 	}
@@ -318,6 +337,39 @@ func (s *Conn) writeFrames(frames ...wire.Frame) error {
 	s.writeMutex.Lock()
 	defer s.writeMutex.Unlock()
 
+	s.mutex.Lock()
+	s.lastFrameTime = time.Now()
+	peerMax := s.peerMaxRecordSize
+	s.mutex.Unlock()
+
+	// Split frames into multiple records if total size exceeds peerMaxRecordSize.
+	// Note: A single frame MUST fit into peerMaxRecordSize.
+	var current []wire.Frame
+	var currentSize uint64
+	for _, f := range frames {
+		fLen := f.Length()
+		if fLen > peerMax {
+			return &Error{ErrorCode: ProtocolViolationError, Message: "frame too large for peer record size"}
+		}
+
+		if currentSize+fLen > peerMax && len(current) > 0 {
+			if err := s.sendRecord(current); err != nil {
+				return err
+			}
+			current = nil
+			currentSize = 0
+		}
+		current = append(current, f)
+		currentSize += fLen
+	}
+
+	if len(current) > 0 {
+		return s.sendRecord(current)
+	}
+	return nil
+}
+
+func (s *Conn) sendRecord(frames []wire.Frame) error {
 	// Use a deadline to avoid blocking forever
 	s.conn.SetWriteDeadline(time.Now().Add(defaultWriteDeadline))
 	err := s.rw.WriteRecord(frames...)
@@ -359,12 +411,63 @@ func (s *Conn) handleFrame(f wire.Frame) error {
 		s.handleMaxStreamsFrame(ff)
 	case *wire.StreamsBlockedFrame:
 		return nil
+	case *wire.DataBlockedFrame:
+		return nil
+	case *wire.StreamDataBlockedFrame:
+		return nil
 	case *wire.PingFrame:
 		s.handlePingFrame(ff)
+	case *wire.DatagramFrame:
+		s.handleDatagramFrame(ff)
 	case *wire.ConnectionCloseFrame:
 		return &quic.ApplicationError{ErrorCode: quic.ApplicationErrorCode(ff.ErrorCode), ErrorMessage: ff.ReasonPhrase}
 	}
 	return nil
+}
+
+func (s *Conn) handleDatagramFrame(f *wire.DatagramFrame) {
+	select {
+	case s.incomingDatagrams <- f.Data:
+	default:
+		// Drop datagram if queue is full as per RFC 9221
+	}
+}
+
+// SendMessage sends a datagram message.
+func (s *Conn) SendMessage(p []byte) error {
+	if !s.config.EnableDatagrams {
+		return errors.New("datagrams not enabled")
+	}
+	s.mutex.Lock()
+	peerMax := s.peerMaxDatagramFrameSize
+	s.mutex.Unlock()
+
+	if uint64(len(p)) > peerMax {
+		return errors.New("message too large")
+	}
+
+	return s.writeFrames(&wire.DatagramFrame{Data: p})
+}
+
+// ReceiveMessage receives a datagram message.
+func (s *Conn) ReceiveMessage(ctx context.Context) ([]byte, error) {
+	if !s.config.EnableDatagrams {
+		return nil, errors.New("datagrams not enabled")
+	}
+	select {
+	case msg := <-s.incomingDatagrams:
+		return msg, nil
+	case <-s.ctx.Done():
+		s.mutex.Lock()
+		err := s.closeErr
+		s.mutex.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("connection closed")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (s *Conn) handleMaxStreamsFrame(f *wire.MaxStreamsFrame) {
@@ -401,7 +504,14 @@ func (s *Conn) getOrCreateBaseStream(id StreamID) (*baseStream, error) {
 		return str, nil
 	}
 
-	str := newBaseStream(id, s, s.config.InitialStreamReceiveWindow, s.config.InitialStreamReceiveWindow)
+	var receiveWindow uint64
+	if id&streamIDUnidirectional == 0 {
+		receiveWindow = s.config.InitialStreamReceiveWindow
+	} else {
+		receiveWindow = s.config.InitialStreamReceiveWindow // We use same for now, but could differentiate
+	}
+
+	str := newBaseStream(id, s, s.config.InitialStreamReceiveWindow, receiveWindow)
 	s.sm.streams[id] = str
 
 	if id&streamIDUnidirectional == 0 { // Bidirectional
