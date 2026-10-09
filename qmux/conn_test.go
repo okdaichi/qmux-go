@@ -121,7 +121,7 @@ func TestConn_OpenStream_LimitReached(t *testing.T) {
 	first, err := client.OpenStreamSync(ctx)
 	require.NoError(t, err)
 	_, err = client.OpenStream()
-	require.ErrorIs(t, err, ErrStreamLimitReached)
+	require.ErrorIs(t, err, quic.StreamLimitReachedError{})
 
 	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
@@ -420,7 +420,10 @@ func TestConn_SendDatagram(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("unreliable in name only"), got)
 
-	assert.ErrorIs(t, client.SendDatagram(make([]byte, 1200)), ErrDatagramTooLarge)
+	var tooLarge *quic.DatagramTooLargeError
+	require.ErrorAs(t, client.SendDatagram(make([]byte, 1200)), &tooLarge)
+	assert.Equal(t, int64(1197), tooLarge.MaxDatagramPayloadSize)
+	assert.NoError(t, client.SendDatagram(make([]byte, 1197)))
 	state := client.ConnectionState()
 	assert.True(t, state.SupportsDatagrams.Local)
 	assert.True(t, state.SupportsDatagrams.Remote)
@@ -727,6 +730,16 @@ func TestConfig_normalized(t *testing.T) {
 				MaxIncomingStreams: 100, MaxIncomingUniStreams: 100,
 				InitialStreamReceiveWindow: 512 * 1024, InitialConnectionReceiveWindow: 1024 * 1024,
 				MaxRecordSize: 16382, MaxIdleTimeout: 30 * time.Second,
+				HandshakeIdleTimeout: 5 * time.Second,
+			},
+		},
+		"keep-alive longer than half the idle timeout": {
+			config: &Config{MaxIdleTimeout: 10 * time.Second, KeepAlivePeriod: 8 * time.Second, HandshakeIdleTimeout: time.Second},
+			expected: Config{
+				MaxIncomingStreams: 100, MaxIncomingUniStreams: 100,
+				InitialStreamReceiveWindow: 512 * 1024, InitialConnectionReceiveWindow: 1024 * 1024,
+				MaxRecordSize: 16382, MaxIdleTimeout: 10 * time.Second,
+				KeepAlivePeriod: 5 * time.Second, HandshakeIdleTimeout: time.Second,
 			},
 		},
 		"limits out of range": {
@@ -739,6 +752,7 @@ func TestConfig_normalized(t *testing.T) {
 				MaxIncomingStreams: 0, MaxIncomingUniStreams: 1 << 60,
 				InitialStreamReceiveWindow: 1, InitialConnectionReceiveWindow: 2,
 				MaxRecordSize: 16382, MaxIdleTimeout: 0,
+				HandshakeIdleTimeout: 5 * time.Second,
 			},
 		},
 		"windows beyond a variable-length integer": {
@@ -750,6 +764,7 @@ func TestConfig_normalized(t *testing.T) {
 				MaxIncomingStreams: 100, MaxIncomingUniStreams: 100,
 				InitialStreamReceiveWindow: 1<<62 - 1, InitialConnectionReceiveWindow: 1<<62 - 1,
 				MaxRecordSize: 1<<62 - 1, MaxIdleTimeout: 30 * time.Second,
+				HandshakeIdleTimeout: 5 * time.Second,
 			},
 		},
 		"datagrams": {
@@ -758,7 +773,8 @@ func TestConfig_normalized(t *testing.T) {
 				MaxIncomingStreams: 100, MaxIncomingUniStreams: 100,
 				InitialStreamReceiveWindow: 512 * 1024, InitialConnectionReceiveWindow: 1024 * 1024,
 				MaxRecordSize: 20000, MaxIdleTimeout: 30 * time.Second,
-				EnableDatagrams: true, MaxDatagramFrameSize: 20000,
+				HandshakeIdleTimeout: 5 * time.Second,
+				EnableDatagrams:      true, MaxDatagramFrameSize: 20000,
 			},
 		},
 	}
@@ -869,4 +885,146 @@ func TestConn_CloseWithError_LongReason(t *testing.T) {
 	require.ErrorAs(t, context.Cause(server.Context()), &remote)
 	assert.Equal(t, ApplicationErrorCode(3), remote.ErrorCode)
 	assert.Len(t, remote.ErrorMessage, maxReasonLength)
+}
+
+func TestReceiveStream_Peek(t *testing.T) {
+	config := &Config{InitialStreamReceiveWindow: 1024}
+	client, server := newTestPair(t, config, config)
+	ctx := testContext(t)
+
+	s, err := client.OpenUniStreamSync(ctx)
+	require.NoError(t, err)
+	_, err = s.Write([]byte("hello"))
+	require.NoError(t, err)
+
+	r, err := server.AcceptUniStream(ctx)
+	require.NoError(t, err)
+
+	// Peeking waits for all of the bytes asked for, and consumes none.
+	peeked := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 8)
+		n, err := r.Peek(buf)
+		if err != nil {
+			return
+		}
+		peeked <- buf[:n]
+	}()
+	_, err = s.Write([]byte(" world"))
+	require.NoError(t, err)
+	select {
+	case got := <-peeked:
+		assert.Equal(t, []byte("hello wo"), got)
+	case <-ctx.Done():
+		require.FailNow(t, "Peek did not return")
+	}
+
+	// At the end of the stream it returns what there is.
+	require.NoError(t, s.Close())
+	buf := make([]byte, 64)
+	n, err := r.Peek(buf)
+	assert.ErrorIs(t, err, io.EOF)
+	assert.Equal(t, []byte("hello world"), buf[:n])
+
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("hello world"), got)
+
+	_, err = r.Peek(make([]byte, 1025))
+	assert.Error(t, err, "a peek larger than the window can never be filled")
+}
+
+func TestReceiveStream_Peek_Deadline(t *testing.T) {
+	client, server := newTestPair(t, nil, nil)
+	ctx := testContext(t)
+
+	s, err := client.OpenUniStreamSync(ctx)
+	require.NoError(t, err)
+	_, err = s.Write([]byte("hi"))
+	require.NoError(t, err)
+	r, err := server.AcceptUniStream(ctx)
+	require.NoError(t, err)
+
+	require.NoError(t, r.SetReadDeadline(time.Now().Add(20*time.Millisecond)))
+	_, err = r.Peek(make([]byte, 3))
+	assert.ErrorIs(t, err, os.ErrDeadlineExceeded)
+}
+
+func TestConn_HandshakeComplete(t *testing.T) {
+	server, peer := newRawPeer(t, nil)
+	require.IsType(t, &wire.TransportParameters{}, peer.next(t))
+
+	select {
+	case <-server.HandshakeComplete():
+		require.FailNow(t, "handshake complete before the peer's transport parameters")
+	default:
+	}
+
+	peer.write(t, (&wire.TransportParameters{}).Append(nil))
+	select {
+	case <-server.HandshakeComplete():
+	case <-time.After(testTimeout):
+		require.FailNow(t, "handshake did not complete")
+	}
+	assert.NoError(t, context.Cause(server.Context()))
+}
+
+// A peer that never sends its transport parameters is not waited for.
+func TestConn_idleLoop_HandshakeTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		client, err := Dial(a, &Config{HandshakeIdleTimeout: 2 * time.Second})
+		require.NoError(t, err)
+		go func() {
+			_, _ = io.Copy(io.Discard, b) // not actionable: ends when the connection closes the pipe
+		}()
+
+		start := time.Now()
+		<-client.HandshakeComplete()
+		assert.Equal(t, 2*time.Second, time.Since(start))
+
+		var timeout *quic.HandshakeTimeoutError
+		assert.ErrorAs(t, context.Cause(client.Context()), &timeout)
+		_, err = client.OpenStream()
+		assert.ErrorAs(t, err, &timeout)
+		assert.ErrorAs(t, client.SendDatagram([]byte("x")), &timeout)
+		client.loops.Wait()
+	})
+}
+
+func TestSendStream_SetPriority(t *testing.T) {
+	client, _ := newTestPair(t, nil, nil)
+
+	s, err := client.OpenUniStreamSync(testContext(t))
+	require.NoError(t, err)
+	assert.Equal(t, priority{urgency: 3, incremental: true, streamID: s.StreamID()}, s.s.priority())
+
+	tests := map[string]struct {
+		urgency     int8
+		incremental bool
+		expected    priority
+	}{
+		"within range":  {urgency: 1, incremental: false, expected: priority{urgency: 1}},
+		"below range":   {urgency: -5, incremental: true, expected: priority{urgency: 0, incremental: true}},
+		"above range":   {urgency: 100, incremental: true, expected: priority{urgency: 7, incremental: true}},
+		"lowest urgent": {urgency: 7, incremental: false, expected: priority{urgency: 7}},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			s.SetPriority(tt.urgency, tt.incremental)
+			tt.expected.streamID = s.StreamID()
+			assert.Equal(t, tt.expected, s.s.priority())
+		})
+	}
+}
+
+func TestConfig_Clone(t *testing.T) {
+	config := &Config{MaxIncomingStreams: 7, EnableDatagrams: true}
+
+	clone := config.Clone()
+	assert.Equal(t, config, clone)
+	clone.MaxIncomingStreams = 8
+	assert.Equal(t, int64(7), config.MaxIncomingStreams)
+
+	assert.Nil(t, (*Config)(nil).Clone())
 }

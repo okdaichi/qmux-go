@@ -41,6 +41,8 @@ type stream struct {
 	readSignal    signal
 
 	canSend       bool
+	urgency       int8
+	incremental   bool
 	sendOffset    uint64
 	sendMax       uint64 // the peer's limit
 	finSent       bool
@@ -64,6 +66,7 @@ func (c *Conn) newStreamLocked(id StreamID) *stream {
 		s.recvMax = c.config.InitialStreamReceiveWindow
 	}
 	if s.canSend {
+		s.urgency, s.incremental = defaultUrgency, true
 		s.ctx, s.cancel = context.WithCancelCause(c.ctx)
 		switch {
 		case uni:
@@ -159,6 +162,46 @@ func (s *stream) tryRead(p []byte) (int, <-chan struct{}, time.Time, error) {
 	}
 	if s.finRecv {
 		return 0, nil, time.Time{}, io.EOF
+	}
+	return 0, s.readSignal.wait(), s.readDeadline, nil
+}
+
+func (s *stream) peek(p []byte) (int, error) {
+	// Peeked data stays in the buffer, so no more than a window of it can
+	// ever be there.
+	if window := s.c.config.InitialStreamReceiveWindow; uint64(len(p)) > window {
+		return 0, fmt.Errorf("qmux: peek of %d bytes exceeds the stream window of %d", len(p), window)
+	}
+	for {
+		n, wake, deadline, err := s.tryPeek(p)
+		if wake == nil {
+			return n, err
+		}
+		if err := wait(deadline, wake, nil); err != nil {
+			return 0, err
+		}
+	}
+}
+
+// tryPeek copies received data to p without consuming it, once there is
+// enough to fill p or the stream has ended. Until then it returns a channel
+// that is closed when the stream's state changes.
+func (s *stream) tryPeek(p []byte) (int, <-chan struct{}, time.Time, error) {
+	c := s.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case c.closeErr != nil:
+		return 0, nil, time.Time{}, c.closeErr
+	case s.recvErr != nil:
+		return 0, nil, time.Time{}, s.recvErr
+	}
+	unread := s.rbuf[s.roff:]
+	switch {
+	case len(unread) >= len(p):
+		return copy(p, unread), nil, time.Time{}, nil
+	case s.finRecv:
+		return copy(p, unread), nil, time.Time{}, io.EOF
 	}
 	return 0, s.readSignal.wait(), s.readDeadline, nil
 }
@@ -277,11 +320,24 @@ func (s *stream) reserve(n int) (offset uint64, reserved int, err error) {
 	return offset, reserved, nil
 }
 
+func (s *stream) setPriority(urgency int8, incremental bool) {
+	s.c.mu.Lock()
+	defer s.c.mu.Unlock()
+	s.urgency = min(max(urgency, 0), maxUrgency)
+	s.incremental = incremental
+}
+
+func (s *stream) priority() priority {
+	s.c.mu.Lock()
+	defer s.c.mu.Unlock()
+	return priority{urgency: s.urgency, incremental: s.incremental, streamID: s.id}
+}
+
 // writeChunk sends the start of p in one record. It may send nothing when
 // another stream took the connection's credit first.
 func (s *stream) writeChunk(p []byte) (int, error) {
 	c := s.c
-	c.writeMu.Lock()
+	c.writeMu.LockPriority(s.priority())
 	defer c.writeMu.Unlock()
 	offset, n, err := s.reserve(len(p))
 	if err != nil || n == 0 {
@@ -317,7 +373,7 @@ func (s *stream) finish() (finalSize uint64, ok bool, err error) {
 
 func (s *stream) closeSend() error {
 	c := s.c
-	c.writeMu.Lock()
+	c.writeMu.LockPriority(s.priority())
 	defer c.writeMu.Unlock()
 	finalSize, ok, err := s.finish()
 	if !ok {
@@ -391,6 +447,12 @@ func (s *ReceiveStream) StreamID() StreamID { return s.s.id }
 // reset or CancelRead, and os.ErrDeadlineExceeded past the read deadline.
 func (s *ReceiveStream) Read(p []byte) (int, error) { return s.s.read(p) }
 
+// Peek fills p with stream data without consuming it. It waits until
+// len(p) bytes are available, respecting the read deadline. If the stream
+// ends first, it returns the bytes there are along with io.EOF. len(p) must
+// not exceed the stream's receive window.
+func (s *ReceiveStream) Peek(p []byte) (int, error) { return s.s.peek(p) }
+
 // CancelRead abandons reading: buffered data is discarded, and the peer is
 // asked to stop sending with the given error code.
 func (s *ReceiveStream) CancelRead(code StreamErrorCode) { s.s.cancelRead(code) }
@@ -429,6 +491,18 @@ func (s *SendStream) CancelWrite(code StreamErrorCode) { s.s.cancelWrite(code) }
 // of the connection. The cause of a reset is its *quic.StreamError.
 func (s *SendStream) Context() context.Context { return s.s.ctx }
 
+// SetPriority sets the priority of the data written to the stream, with the
+// urgency and incremental parameters of RFC 9218. Urgency is clipped to the
+// range 0 through 7, and lower values go first. Within an urgency,
+// incremental streams take turns, and the others go in the order of their
+// stream ID. The default is urgency 3, incremental.
+//
+// Priorities decide which stream writes the next record when several wait
+// for the transport. Data already handed to the transport is not reordered.
+func (s *SendStream) SetPriority(urgency int8, incremental bool) {
+	s.s.setPriority(urgency, incremental)
+}
+
 // SetWriteDeadline sets the deadline for Write calls, pending and future.
 // A zero value means no deadline. The deadline bounds the wait for the
 // peer's flow control; a write that the transport itself holds up ends
@@ -465,6 +539,16 @@ func (s *Stream) CancelWrite(code StreamErrorCode) { s.s.cancelWrite(code) }
 // Context returns a context that is cancelled when the sending side ends.
 // See SendStream.Context.
 func (s *Stream) Context() context.Context { return s.s.ctx }
+
+// SetPriority sets the priority of the data written to the stream. See
+// SendStream.SetPriority.
+func (s *Stream) SetPriority(urgency int8, incremental bool) {
+	s.s.setPriority(urgency, incremental)
+}
+
+// Peek fills p with stream data without consuming it. See
+// ReceiveStream.Peek.
+func (s *Stream) Peek(p []byte) (int, error) { return s.s.peek(p) }
 
 // SetDeadline sets the read and write deadlines.
 func (s *Stream) SetDeadline(t time.Time) error {

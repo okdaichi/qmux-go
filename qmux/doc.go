@@ -52,7 +52,8 @@ messages as a plain byte stream.
 # Differences from QUIC
 
 All streams share one ordered transport: a lost segment delays every stream,
-and a datagram, once sent, is delivered reliably. Stream priorities are not
-implemented.
+and a datagram, once sent, is delivered reliably. Stream priorities order the
+writes that wait for the transport; what the transport already holds is sent
+in the order it was written.
 */
 package qmux

@@ -18,6 +18,7 @@ const (
 	defaultStreamReceiveWindow     = 512 * 1024
 	defaultConnectionReceiveWindow = 1024 * 1024
 	defaultMaxIdleTimeout          = 30 * time.Second
+	defaultHandshakeIdleTimeout    = 5 * time.Second
 	defaultMaxDatagramFrameSize    = 1200
 )
 
@@ -44,8 +45,12 @@ type Config struct {
 	// which is also the minimum, is 16382 bytes.
 	MaxRecordSize uint64
 	// KeepAlivePeriod is the interval between QX_PING frames. Zero sends
-	// none.
+	// none. It is at most half of MaxIdleTimeout.
 	KeepAlivePeriod time.Duration
+	// HandshakeIdleTimeout closes the connection when the peer's transport
+	// parameters have not arrived within this long. The default is 5
+	// seconds.
+	HandshakeIdleTimeout time.Duration
 	// MaxIdleTimeout closes the connection when no record was sent or
 	// received for this long. The peer's own timeout applies when it is
 	// shorter. The default is 30 seconds; a negative value declares none.
@@ -62,6 +67,15 @@ type Config struct {
 func DefaultConfig() *Config {
 	c := (*Config)(nil).normalized()
 	return &c
+}
+
+// Clone returns a copy of the configuration.
+func (c *Config) Clone() *Config {
+	if c == nil {
+		return nil
+	}
+	clone := *c
+	return &clone
 }
 
 // normalized returns a copy of the configuration with every default filled
@@ -87,6 +101,12 @@ func (c *Config) normalized() Config {
 		n.MaxIdleTimeout = defaultMaxIdleTimeout
 	}
 	n.MaxIdleTimeout = max(n.MaxIdleTimeout, 0)
+	if n.HandshakeIdleTimeout <= 0 {
+		n.HandshakeIdleTimeout = defaultHandshakeIdleTimeout
+	}
+	if n.KeepAlivePeriod > 0 && n.MaxIdleTimeout > 0 {
+		n.KeepAlivePeriod = min(n.KeepAlivePeriod, n.MaxIdleTimeout/2)
+	}
 	if !n.EnableDatagrams {
 		n.MaxDatagramFrameSize = 0
 	} else if n.MaxDatagramFrameSize == 0 {

@@ -10,14 +10,14 @@ It follows **[draft-ietf-quic-qmux-02](https://www.ietf.org/archive/id/draft-iet
 
 ## Features
 
-- **Streams**: bidirectional and unidirectional, with QUIC's stream limits, flow control, resets and deadlines.
+- **Streams**: bidirectional and unidirectional, with QUIC's stream limits, flow control, resets, deadlines and priorities (RFC 9218).
 - **Datagrams**: the `DATAGRAM` extension (RFC 9221), delivered reliably and in order as QMux specifies.
 - **Transports**: any `net.Conn` (TCP, TLS, Unix sockets), or a message transport such as WebSocket with one record per message (`DialMessages`, `ServerMessages`).
 - **quic-go shaped API**: `Conn` and its streams mirror quic-go's, and report errors with its error types.
 
 QMux does not negotiate the application protocol: the transport does, with ALPN over TLS or the subprotocol over WebSocket (for example `qmux-02.myapp`).
 
-Not implemented: stream priorities, `RESET_STREAM_AT`, and 0-RTT.
+Not implemented: `RESET_STREAM_AT`, 0-RTT, and flow control window auto-tuning.
 
 ## Installation
 

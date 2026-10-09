@@ -11,6 +11,7 @@ import (
 
 	"github.com/okdaichi/qmux-go/qmux/internal/wire"
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 const (
@@ -88,7 +89,8 @@ type Conn struct {
 	// loops counts the connection's goroutines. They all end with ctx.
 	loops sync.WaitGroup
 
-	// handshake is closed once the peer's transport parameters are in.
+	// handshake is closed once the peer's transport parameters are in, or
+	// the connection has ended without them.
 	handshake chan struct{}
 
 	// writeMu serializes records on the transport. It is taken before mu,
@@ -96,7 +98,7 @@ type Conn struct {
 	// it from reserving flow control credit to writing the data, so that
 	// what follows in the control queue (a RESET_STREAM, say) follows on
 	// the wire too.
-	writeMu sync.Mutex
+	writeMu writeLock
 	wbuf    []byte // record under construction; guarded by writeMu
 
 	mu       sync.Mutex
@@ -366,9 +368,16 @@ func (c *Conn) readLoop() {
 }
 
 func (c *Conn) idleLoop() {
-	timer := time.NewTimer(time.Hour)
+	timer := time.NewTimer(c.config.HandshakeIdleTimeout)
 	defer timer.Stop()
-	handshake := c.handshake
+	select {
+	case <-c.handshake:
+	case <-timer.C:
+		c.closeGracefully(&quic.HandshakeTimeoutError{}, nil)
+		return
+	case <-c.ctx.Done():
+		return
+	}
 	for {
 		var expired <-chan time.Time
 		if timeout := c.currentIdleTimeout(); timeout > 0 {
@@ -383,9 +392,6 @@ func (c *Conn) idleLoop() {
 		}
 		select {
 		case <-expired:
-		case <-handshake:
-			// The peer's parameters may have shortened the timeout.
-			handshake = nil
 		case <-c.ctx.Done():
 			return
 		}
@@ -439,6 +445,9 @@ func (c *Conn) terminate(err error) bool {
 	}
 	c.closeErr = err
 	c.cancel(err)
+	if !c.ready {
+		close(c.handshake)
+	}
 	c.sendSignal.broadcast()
 	for dir := range c.out {
 		c.out[dir].signal.broadcast()
@@ -837,12 +846,23 @@ func (c *Conn) completeLocked(s *stream) {
 func (c *Conn) waitHandshake(ctx context.Context) error {
 	select {
 	case <-c.handshake:
-		return nil
-	case <-c.ctx.Done():
+		// Also closed when the connection ends without the parameters.
 		return context.Cause(c.ctx)
 	case <-ctx.Done():
+		// ctx is the connection's own for the calls that take none.
+		if err := context.Cause(c.ctx); err != nil {
+			return err
+		}
 		return ctx.Err()
 	}
+}
+
+// HandshakeComplete returns a channel that is closed once the peer's
+// transport parameters are in, or the connection has ended without them.
+// Streams cannot be opened and nothing can be sent before then: OpenStream
+// and the other operations wait for it by themselves.
+func (c *Conn) HandshakeComplete() <-chan struct{} {
+	return c.handshake
 }
 
 // tryOpen opens a stream if the peer's limit allows it. Otherwise it
@@ -873,7 +893,7 @@ func (c *Conn) open(ctx context.Context, dir int, block bool) (*stream, error) {
 			return s, err
 		}
 		if !block {
-			return nil, ErrStreamLimitReached
+			return nil, quic.StreamLimitReachedError{}
 		}
 		select {
 		case <-wake:
@@ -938,8 +958,8 @@ func (c *Conn) AcceptUniStream(ctx context.Context) (*ReceiveStream, error) {
 }
 
 // OpenStream opens a bidirectional stream. It waits for the peer's
-// transport parameters, and then fails with ErrStreamLimitReached if the
-// peer's stream limit is reached. The peer learns of the stream with the
+// transport parameters, and then fails with a quic.StreamLimitReachedError
+// if the peer's stream limit is reached. The peer learns of the stream with the
 // first data written to it.
 func (c *Conn) OpenStream() (*Stream, error) {
 	s, err := c.open(c.ctx, dirBidi, false)
@@ -960,8 +980,8 @@ func (c *Conn) OpenStreamSync(ctx context.Context) (*Stream, error) {
 }
 
 // OpenUniStream opens a unidirectional stream. It waits for the peer's
-// transport parameters, and then fails with ErrStreamLimitReached if the
-// peer's stream limit is reached.
+// transport parameters, and then fails with a quic.StreamLimitReachedError
+// if the peer's stream limit is reached.
 func (c *Conn) OpenUniStream() (*SendStream, error) {
 	s, err := c.open(c.ctx, dirUni, false)
 	if err != nil {
@@ -980,8 +1000,9 @@ func (c *Conn) OpenUniStreamSync(ctx context.Context) (*SendStream, error) {
 	return &SendStream{s: s}, nil
 }
 
-// SendDatagram sends a datagram. It fails if the peer does not accept
-// datagrams, or none as large as p.
+// SendDatagram sends a datagram. It fails with ErrDatagramsNotSupported if
+// the peer does not accept datagrams, and with a *quic.DatagramTooLargeError
+// if it accepts none as large as p.
 func (c *Conn) SendDatagram(p []byte) error {
 	if err := c.waitHandshake(c.ctx); err != nil {
 		return err
@@ -992,7 +1013,9 @@ func (c *Conn) SendDatagram(p []byte) error {
 		return ErrDatagramsNotSupported
 	}
 	if uint64(f.Len()) > limit {
-		return fmt.Errorf("%w: frame of %d bytes, peer accepts %d", ErrDatagramTooLarge, f.Len(), limit)
+		// The frame's type and length take the rest of the limit.
+		payload := limit - 1 - uint64(quicvarint.Len(limit))
+		return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: int64(payload)}
 	}
 
 	c.writeMu.Lock()

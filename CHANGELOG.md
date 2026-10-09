@@ -22,13 +22,21 @@ The connection, stream and wire code is rewritten against **draft-ietf-quic-qmux
 ### Added
 - `DialMessages` and `ServerMessages`: one record per message, without the `Size` field. This is the WebSocket mapping of `@moq/qmux`, which the implementation is tested against.
 - `SendStream.Context` and `Stream.Context`, cancelled when the sending side ends.
-- `ErrStreamLimitReached`, `ErrDatagramsNotSupported`, `ErrDatagramTooLarge`.
+- `ErrDatagramsNotSupported`.
+- `SetPriority` on `SendStream` and `Stream`, with the urgency and incremental parameters of RFC 9218 and quic-go's defaults. When several streams wait for the transport, the most urgent writes the next record; control frames go ahead of all stream data.
+- `Peek` on `ReceiveStream` and `Stream`.
+- `Conn.HandshakeComplete`.
+- `Config.HandshakeIdleTimeout` (5 seconds by default): a peer that never sends its transport parameters ends the connection with a `*quic.HandshakeTimeoutError`.
+- `Config.Clone`.
 
 ### Changed
 - **Breaking**: `Config.ApplicationProtocols` is removed, with the private transport parameter behind it. The draft leaves protocol negotiation to the transport (ALPN, or the WebSocket subprotocol) and forbids undeclared parameters.
-- **Breaking**: `OpenStream` and `OpenUniStream` no longer wait at the stream limit; they return `ErrStreamLimitReached`. Use the `Sync` variants to wait.
+- **Breaking**: `OpenStream` and `OpenUniStream` no longer wait at the stream limit; they return a `quic.StreamLimitReachedError`, as quic-go does. Use the `Sync` variants to wait.
 - **Breaking**: a stream reaches the peer with the first frame sent on it, as in QUIC, not when it is opened.
 - `Stream.Close` ends the sending side only.
+- `SendDatagram` returns a `*quic.DatagramTooLargeError` for a datagram larger than the peer accepts.
+- `Config.KeepAlivePeriod` is at most half of `MaxIdleTimeout`.
+- quic-go is required at v0.63.0.
 - Zero fields of `Config` take their defaults. The default windows are 512 KiB per stream and 1 MiB per connection.
 - `Write` and `Close` write to the transport directly, so a slow peer applies backpressure instead of growing a queue.
 
