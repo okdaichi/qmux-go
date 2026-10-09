@@ -3,7 +3,7 @@ module github.com/okdaichi/qmux-go
 go 1.26.1
 
 require (
-	github.com/coder/websocket v1.8.14
+	github.com/coder/websocket v1.8.15
 	github.com/gorilla/websocket v1.5.3
 	github.com/quic-go/quic-go v0.63.0
 	github.com/stretchr/testify v1.12.1
