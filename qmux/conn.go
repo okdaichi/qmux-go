@@ -842,29 +842,6 @@ func (c *Conn) completeLocked(s *stream) {
 	}
 }
 
-// waitHandshake waits for the peer's transport parameters.
-func (c *Conn) waitHandshake(ctx context.Context) error {
-	select {
-	case <-c.handshake:
-		// Also closed when the connection ends without the parameters.
-		return context.Cause(c.ctx)
-	case <-ctx.Done():
-		// ctx is the connection's own for the calls that take none.
-		if err := context.Cause(c.ctx); err != nil {
-			return err
-		}
-		return ctx.Err()
-	}
-}
-
-// HandshakeComplete returns a channel that is closed once the peer's
-// transport parameters are in, or the connection has ended without them.
-// Streams cannot be opened and nothing can be sent before then: OpenStream
-// and the other operations wait for it by themselves.
-func (c *Conn) HandshakeComplete() <-chan struct{} {
-	return c.handshake
-}
-
 // tryOpen opens a stream if the peer's limit allows it. Otherwise it
 // returns a channel that is closed when the limit may have changed.
 func (c *Conn) tryOpen(dir int) (*stream, <-chan struct{}, error) {
@@ -883,17 +860,21 @@ func (c *Conn) tryOpen(dir int) (*stream, <-chan struct{}, error) {
 	return s, nil, nil
 }
 
-func (c *Conn) open(ctx context.Context, dir int, block bool) (*stream, error) {
-	if err := c.waitHandshake(ctx); err != nil {
-		return nil, err
+// openNow opens a stream, and fails at the peer's stream limit.
+func (c *Conn) openNow(dir int) (*stream, error) {
+	s, _, err := c.tryOpen(dir)
+	if s == nil && err == nil {
+		err = quic.StreamLimitReachedError{}
 	}
+	return s, err
+}
+
+// open opens a stream, waiting at the peer's stream limit.
+func (c *Conn) open(ctx context.Context, dir int) (*stream, error) {
 	for {
 		s, wake, err := c.tryOpen(dir)
 		if s != nil || err != nil {
 			return s, err
-		}
-		if !block {
-			return nil, quic.StreamLimitReachedError{}
 		}
 		select {
 		case <-wake:
@@ -957,12 +938,11 @@ func (c *Conn) AcceptUniStream(ctx context.Context) (*ReceiveStream, error) {
 	return &ReceiveStream{s: s}, nil
 }
 
-// OpenStream opens a bidirectional stream. It waits for the peer's
-// transport parameters, and then fails with a quic.StreamLimitReachedError
-// if the peer's stream limit is reached. The peer learns of the stream with the
-// first data written to it.
+// OpenStream opens a bidirectional stream. It fails with a
+// quic.StreamLimitReachedError if the peer's stream limit is reached. The
+// peer learns of the stream with the first data written to it.
 func (c *Conn) OpenStream() (*Stream, error) {
-	s, err := c.open(c.ctx, dirBidi, false)
+	s, err := c.openNow(dirBidi)
 	if err != nil {
 		return nil, err
 	}
@@ -972,18 +952,17 @@ func (c *Conn) OpenStream() (*Stream, error) {
 // OpenStreamSync opens a bidirectional stream, waiting while the peer's
 // stream limit is reached.
 func (c *Conn) OpenStreamSync(ctx context.Context) (*Stream, error) {
-	s, err := c.open(ctx, dirBidi, true)
+	s, err := c.open(ctx, dirBidi)
 	if err != nil {
 		return nil, err
 	}
 	return &Stream{s: s}, nil
 }
 
-// OpenUniStream opens a unidirectional stream. It waits for the peer's
-// transport parameters, and then fails with a quic.StreamLimitReachedError
-// if the peer's stream limit is reached.
+// OpenUniStream opens a unidirectional stream. It fails with a
+// quic.StreamLimitReachedError if the peer's stream limit is reached.
 func (c *Conn) OpenUniStream() (*SendStream, error) {
-	s, err := c.open(c.ctx, dirUni, false)
+	s, err := c.openNow(dirUni)
 	if err != nil {
 		return nil, err
 	}
@@ -993,7 +972,7 @@ func (c *Conn) OpenUniStream() (*SendStream, error) {
 // OpenUniStreamSync opens a unidirectional stream, waiting while the
 // peer's stream limit is reached.
 func (c *Conn) OpenUniStreamSync(ctx context.Context) (*SendStream, error) {
-	s, err := c.open(ctx, dirUni, true)
+	s, err := c.open(ctx, dirUni)
 	if err != nil {
 		return nil, err
 	}
@@ -1004,9 +983,6 @@ func (c *Conn) OpenUniStreamSync(ctx context.Context) (*SendStream, error) {
 // the peer does not accept datagrams, and with a *quic.DatagramTooLargeError
 // if it accepts none as large as p.
 func (c *Conn) SendDatagram(p []byte) error {
-	if err := c.waitHandshake(c.ctx); err != nil {
-		return err
-	}
 	f := &wire.Datagram{Data: p}
 	limit := c.datagramLimit()
 	if limit == 0 {

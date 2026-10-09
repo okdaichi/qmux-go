@@ -25,12 +25,13 @@ The connection, stream and wire code is rewritten against **draft-ietf-quic-qmux
 - `ErrDatagramsNotSupported`.
 - `SetPriority` on `SendStream` and `Stream`, with the urgency and incremental parameters of RFC 9218 and quic-go's defaults. When several streams wait for the transport, the most urgent writes the next record; control frames go ahead of all stream data.
 - `Peek` on `ReceiveStream` and `Stream`.
-- `Conn.HandshakeComplete`.
-- `Config.HandshakeIdleTimeout` (5 seconds by default): a peer that never sends its transport parameters ends the connection with a `*quic.HandshakeTimeoutError`.
+- `Config.HandshakeIdleTimeout` (5 seconds by default): `Dial` and `Server` fail with a `*quic.HandshakeTimeoutError` when the peer never sends its transport parameters.
 - `Config.Clone`.
 
 ### Changed
 - **Breaking**: `Config.ApplicationProtocols` is removed, with the private transport parameter behind it. The draft leaves protocol negotiation to the transport (ALPN, or the WebSocket subprotocol) and forbids undeclared parameters.
+- **Breaking**: `Dial`, `Server`, `DialMessages` and `ServerMessages` take a `context.Context` and return once the peer's transport parameters are in, as `quic.Dial` returns once the handshake is done. A peer that fails the handshake fails the call.
+- **Breaking**: the `TransportErrorCode` constants (`InternalError`, `ProtocolViolationError`, ...) are removed. quic-go exports the same codes: `quic.InternalError`, `quic.ProtocolViolation` and so on.
 - **Breaking**: `OpenStream` and `OpenUniStream` no longer wait at the stream limit; they return a `quic.StreamLimitReachedError`, as quic-go does. Use the `Sync` variants to wait.
 - **Breaking**: a stream reaches the peer with the first frame sent on it, as in QUIC, not when it is opened.
 - `Stream.Close` ends the sending side only.

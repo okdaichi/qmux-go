@@ -45,10 +45,7 @@ func newTestPair(tb testing.TB, clientConfig, serverConfig *Config) (client, ser
 	serverConn, ok := <-accepted
 	require.True(tb, ok, "accept failed")
 
-	client, err = Dial(clientConn, clientConfig)
-	require.NoError(tb, err)
-	server, err = Server(serverConn, serverConfig)
-	require.NoError(tb, err)
+	client, server = startPair(tb, clientConn, serverConn, clientConfig, serverConfig)
 	tb.Cleanup(func() {
 		assert.NoError(tb, client.Close())
 		assert.NoError(tb, server.Close())
@@ -57,6 +54,27 @@ func newTestPair(tb testing.TB, clientConfig, serverConfig *Config) (client, ser
 		server.loops.Wait()
 	})
 	return client, server
+}
+
+// started is what Dial or Server returned.
+type started struct {
+	conn *Conn
+	err  error
+}
+
+// startPair runs the handshake of a client over a and a server over b.
+func startPair(tb testing.TB, a, b net.Conn, clientConfig, serverConfig *Config) (client, server *Conn) {
+	tb.Helper()
+	accepted := make(chan started, 1)
+	go func() {
+		conn, err := Server(tb.Context(), b, serverConfig)
+		accepted <- started{conn, err}
+	}()
+	client, err := Dial(tb.Context(), a, clientConfig)
+	require.NoError(tb, err)
+	res := <-accepted
+	require.NoError(tb, res.err)
+	return client, res.conn
 }
 
 func testContext(tb testing.TB) context.Context {
@@ -350,10 +368,8 @@ func TestConn_idleLoop_Timeout(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		a, b := net.Pipe()
 		// The shorter of the two timeouts applies to both ends.
-		client, err := Dial(a, &Config{MaxIdleTimeout: 50 * time.Millisecond})
-		require.NoError(t, err)
-		server, err := Server(b, &Config{MaxIdleTimeout: time.Hour})
-		require.NoError(t, err)
+		client, server := startPair(t, a, b,
+			&Config{MaxIdleTimeout: 50 * time.Millisecond}, &Config{MaxIdleTimeout: time.Hour})
 
 		start := time.Now()
 		<-client.Context().Done()
@@ -374,10 +390,9 @@ func TestConn_idleLoop_Timeout(t *testing.T) {
 func TestConn_keepAliveLoop(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		a, b := net.Pipe()
-		client, err := Dial(a, &Config{MaxIdleTimeout: 200 * time.Millisecond, KeepAlivePeriod: 20 * time.Millisecond})
-		require.NoError(t, err)
-		server, err := Server(b, &Config{MaxIdleTimeout: 200 * time.Millisecond})
-		require.NoError(t, err)
+		client, server := startPair(t, a, b,
+			&Config{MaxIdleTimeout: 200 * time.Millisecond, KeepAlivePeriod: 20 * time.Millisecond},
+			&Config{MaxIdleTimeout: 200 * time.Millisecond})
 
 		// Three times the idle timeout, with nothing but pings.
 		time.Sleep(600 * time.Millisecond)
@@ -435,26 +450,34 @@ func TestConn_SendDatagram_NotSupported(t *testing.T) {
 	assert.ErrorIs(t, client.SendDatagram([]byte("x")), ErrDatagramsNotSupported)
 }
 
-// rawPeer is the far end of a connection under test, driven by hand.
+// rawPeer is the far end of a server connection under test, driven by hand.
 type rawPeer struct {
 	conn    net.Conn
-	records chan []byte // the Frames field of each record the connection sent
+	records chan []byte  // the Frames field of each record the connection sent
+	started chan started // what Server returned
+	server  *Conn        // set by accept
 }
 
 // newRawPeer starts a server connection over an in-memory pipe and returns
-// the other end.
-func newRawPeer(tb testing.TB, config *Config) (*Conn, *rawPeer) {
+// the other end. Server returns once the peer has played its part: see
+// accept and refused.
+func newRawPeer(tb testing.TB, config *Config) *rawPeer {
 	tb.Helper()
 	local, remote := net.Pipe()
-	server, err := Server(local, config)
-	require.NoError(tb, err)
+	p := &rawPeer{conn: remote, records: make(chan []byte, 16), started: make(chan started, 1)}
+	go func() {
+		conn, err := Server(tb.Context(), local, config)
+		p.started <- started{conn, err}
+	}()
 	tb.Cleanup(func() {
-		assert.NoError(tb, server.Close())
+		if p.server != nil {
+			assert.NoError(tb, p.server.Close())
+		}
 		assert.NoError(tb, remote.Close())
-		server.loops.Wait()
+		if p.server != nil {
+			p.server.loops.Wait()
+		}
 	})
-
-	p := &rawPeer{conn: remote, records: make(chan []byte, 16)}
 	go func() {
 		defer close(p.records)
 		for {
@@ -477,7 +500,36 @@ func newRawPeer(tb testing.TB, config *Config) (*Conn, *rawPeer) {
 			p.records <- rec
 		}
 	}()
-	return server, p
+	return p
+}
+
+// accept completes the handshake with the given transport parameters and
+// returns the server connection.
+func (p *rawPeer) accept(tb testing.TB, params wire.Parameters) *Conn {
+	tb.Helper()
+	require.IsType(tb, &wire.TransportParameters{}, p.next(tb))
+	p.write(tb, (&wire.TransportParameters{Parameters: params}).Append(nil))
+	select {
+	case res := <-p.started:
+		require.NoError(tb, res.err)
+		p.server = res.conn
+	case <-time.After(testTimeout):
+		require.FailNow(tb, "Server did not return")
+	}
+	return p.server
+}
+
+// refused returns the error Server failed with.
+func (p *rawPeer) refused(tb testing.TB) error {
+	tb.Helper()
+	select {
+	case res := <-p.started:
+		require.Nil(tb, res.conn, "Server returned a connection")
+		return res.err
+	case <-time.After(testTimeout):
+		require.FailNow(tb, "Server did not return")
+		return nil
+	}
 }
 
 // write sends frames as one record.
@@ -503,11 +555,12 @@ func (p *rawPeer) next(tb testing.TB) any {
 }
 
 func TestConn_handleRecord_ProtocolError(t *testing.T) {
-	params := (&wire.TransportParameters{Parameters: wire.Parameters{
+	peerParams := wire.Parameters{
 		InitialMaxData:                 1 << 20,
 		InitialMaxStreamDataBidiRemote: 1 << 20,
 		InitialMaxStreamsBidi:          10,
-	}}).Append(nil)
+	}
+	params := (&wire.TransportParameters{Parameters: peerParams}).Append(nil)
 	frames := func(fs ...wire.Frame) []byte {
 		var b []byte
 		for _, f := range fs {
@@ -517,7 +570,8 @@ func TestConn_handleRecord_ProtocolError(t *testing.T) {
 	}
 
 	tests := map[string]struct {
-		// records are sent after the transport parameters, unless raw.
+		// records are sent after the handshake, or in its place when raw:
+		// Server then fails.
 		records [][]byte
 		raw     bool
 		code    uint64
@@ -600,16 +654,17 @@ func TestConn_handleRecord_ProtocolError(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			server, peer := newRawPeer(t, &Config{
+			peer := newRawPeer(t, &Config{
 				MaxIncomingStreams:             2,
 				MaxIncomingUniStreams:          2,
 				InitialStreamReceiveWindow:     1024,
 				InitialConnectionReceiveWindow: 2048,
 			})
-			require.IsType(t, &wire.TransportParameters{}, peer.next(t))
-
-			if !tt.raw {
-				peer.write(t, params)
+			var server *Conn
+			if tt.raw {
+				require.IsType(t, &wire.TransportParameters{}, peer.next(t))
+			} else {
+				server = peer.accept(t, peerParams)
 			}
 			for _, rec := range tt.records {
 				peer.write(t, rec)
@@ -620,9 +675,15 @@ func TestConn_handleRecord_ProtocolError(t *testing.T) {
 			assert.False(t, closeFrame.Application)
 			assert.Equal(t, tt.code, closeFrame.Code)
 
-			<-server.Context().Done()
+			var cause error
+			if tt.raw {
+				cause = peer.refused(t)
+			} else {
+				<-server.Context().Done()
+				cause = context.Cause(server.Context())
+			}
 			var terr *quic.TransportError
-			require.ErrorAs(t, context.Cause(server.Context()), &terr)
+			require.ErrorAs(t, cause, &terr)
 			assert.Equal(t, quic.TransportErrorCode(tt.code), terr.ErrorCode)
 			assert.False(t, terr.Remote)
 		})
@@ -630,7 +691,7 @@ func TestConn_handleRecord_ProtocolError(t *testing.T) {
 }
 
 func TestConn_localParameters(t *testing.T) {
-	_, peer := newRawPeer(t, &Config{
+	peer := newRawPeer(t, &Config{
 		MaxIncomingStreams:             3,
 		MaxIncomingUniStreams:          -1,
 		InitialStreamReceiveWindow:     1000,
@@ -654,40 +715,39 @@ func TestConn_localParameters(t *testing.T) {
 
 // The peer's CONNECTION_CLOSE of the transport kind is reported as such.
 func TestConn_handleRecord_PeerTransportClose(t *testing.T) {
-	server, peer := newRawPeer(t, nil)
-	require.IsType(t, &wire.TransportParameters{}, peer.next(t))
+	peer := newRawPeer(t, nil)
+	server := peer.accept(t, wire.Parameters{})
 
-	peer.write(t, (&wire.TransportParameters{}).Append(nil))
 	peer.write(t, (&wire.ConnectionClose{Code: wire.InternalError, Reason: "oops"}).Append(nil))
 
 	<-server.Context().Done()
 	var terr *quic.TransportError
 	require.ErrorAs(t, context.Cause(server.Context()), &terr)
 	assert.True(t, terr.Remote)
-	assert.Equal(t, InternalError, terr.ErrorCode)
+	assert.Equal(t, quic.InternalError, terr.ErrorCode)
 	assert.Equal(t, "oops", terr.ErrorMessage)
 }
 
 // Over a message transport a record is one message, without its Size field.
 func TestServerMessages(t *testing.T) {
 	mc := &fakeMessageConn{in: make(chan []byte, 8), out: make(chan []byte, 8)}
-	server, err := ServerMessages(mc, nil)
-	require.NoError(t, err)
-	defer func() {
-		assert.NoError(t, server.Close())
-		server.loops.Wait()
-	}()
 	ctx := testContext(t)
-
-	first, _, err := wire.Parse(<-mc.out)
-	require.NoError(t, err)
-	require.IsType(t, &wire.TransportParameters{}, first)
-
 	mc.in <- (&wire.TransportParameters{Parameters: wire.Parameters{
 		InitialMaxData:          1 << 20,
 		InitialMaxStreamDataUni: 1 << 20,
 		InitialMaxStreamsUni:    1,
 	}}).Append(nil)
+	server, err := ServerMessages(ctx, mc, nil)
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, server.Close())
+		server.loops.Wait()
+	}()
+
+	first, _, err := wire.Parse(<-mc.out)
+	require.NoError(t, err)
+	require.IsType(t, &wire.TransportParameters{}, first)
+
 	// A STREAM frame without a length runs to the end of the message.
 	mc.in <- []byte{0x09, 0x02, 'h', 'i'}
 
@@ -826,9 +886,6 @@ func TestStream_Read_BufferBounded(t *testing.T) {
 func TestConn_keepAliveLoop_DeadPeer(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		a, b := net.Pipe()
-		client, err := Dial(a, &Config{MaxIdleTimeout: 100 * time.Millisecond, KeepAlivePeriod: 20 * time.Millisecond})
-		require.NoError(t, err)
-
 		// The peer sends its transport parameters, then reads and never
 		// answers.
 		go func() {
@@ -838,8 +895,10 @@ func TestConn_keepAliveLoop_DeadPeer(t *testing.T) {
 			}
 			_, _ = io.Copy(io.Discard, b) // not actionable: ends when the connection closes the pipe
 		}()
-
 		start := time.Now()
+		client, err := Dial(t.Context(), a, &Config{MaxIdleTimeout: 100 * time.Millisecond, KeepAlivePeriod: 20 * time.Millisecond})
+		require.NoError(t, err)
+
 		<-client.Context().Done()
 		var idle *quic.IdleTimeoutError
 		assert.ErrorAs(t, context.Cause(client.Context()), &idle)
@@ -851,10 +910,9 @@ func TestConn_keepAliveLoop_DeadPeer(t *testing.T) {
 
 // A DATAGRAM frame without a length may be as large as the limit.
 func TestConn_ReceiveDatagram_WithoutLength(t *testing.T) {
-	server, peer := newRawPeer(t, &Config{EnableDatagrams: true})
-	require.IsType(t, &wire.TransportParameters{}, peer.next(t))
+	peer := newRawPeer(t, &Config{EnableDatagrams: true})
+	server := peer.accept(t, wire.Parameters{})
 
-	peer.write(t, (&wire.TransportParameters{}).Append(nil))
 	peer.write(t, append([]byte{0x30}, make([]byte, 1199)...))
 
 	got, err := server.ReceiveDatagram(testContext(t))
@@ -864,12 +922,9 @@ func TestConn_ReceiveDatagram_WithoutLength(t *testing.T) {
 
 // An idle timeout too long for a time.Duration leaves the local one alone.
 func TestConn_handleRecord_HugeIdleTimeout(t *testing.T) {
-	server, peer := newRawPeer(t, &Config{MaxIdleTimeout: time.Minute})
-	require.IsType(t, &wire.TransportParameters{}, peer.next(t))
+	peer := newRawPeer(t, &Config{MaxIdleTimeout: time.Minute})
+	server := peer.accept(t, wire.Parameters{MaxIdleTimeout: 1<<62 - 1})
 
-	peer.write(t, (&wire.TransportParameters{Parameters: wire.Parameters{MaxIdleTimeout: 1<<62 - 1}}).Append(nil))
-
-	<-server.handshake
 	assert.Equal(t, time.Minute, server.currentIdleTimeout())
 }
 
@@ -950,45 +1005,41 @@ func TestReceiveStream_Peek_Deadline(t *testing.T) {
 	assert.ErrorIs(t, err, os.ErrDeadlineExceeded)
 }
 
-func TestConn_HandshakeComplete(t *testing.T) {
-	server, peer := newRawPeer(t, nil)
-	require.IsType(t, &wire.TransportParameters{}, peer.next(t))
-
-	select {
-	case <-server.HandshakeComplete():
-		require.FailNow(t, "handshake complete before the peer's transport parameters")
-	default:
-	}
-
-	peer.write(t, (&wire.TransportParameters{}).Append(nil))
-	select {
-	case <-server.HandshakeComplete():
-	case <-time.After(testTimeout):
-		require.FailNow(t, "handshake did not complete")
-	}
-	assert.NoError(t, context.Cause(server.Context()))
-}
-
 // A peer that never sends its transport parameters is not waited for.
-func TestConn_idleLoop_HandshakeTimeout(t *testing.T) {
+func TestDial_HandshakeTimeout(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		a, b := net.Pipe()
-		client, err := Dial(a, &Config{HandshakeIdleTimeout: 2 * time.Second})
-		require.NoError(t, err)
 		go func() {
 			_, _ = io.Copy(io.Discard, b) // not actionable: ends when the connection closes the pipe
 		}()
 
 		start := time.Now()
-		<-client.HandshakeComplete()
-		assert.Equal(t, 2*time.Second, time.Since(start))
-
+		client, err := Dial(t.Context(), a, &Config{HandshakeIdleTimeout: 2 * time.Second})
 		var timeout *quic.HandshakeTimeoutError
-		assert.ErrorAs(t, context.Cause(client.Context()), &timeout)
-		_, err = client.OpenStream()
-		assert.ErrorAs(t, err, &timeout)
-		assert.ErrorAs(t, client.SendDatagram([]byte("x")), &timeout)
-		client.loops.Wait()
+		require.ErrorAs(t, err, &timeout)
+		assert.Nil(t, client)
+		assert.Equal(t, 2*time.Second, time.Since(start))
+	})
+}
+
+// A cancelled context ends the wait, and the connection with it.
+func TestDial_ContextCancelled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		closed := make(chan struct{})
+		go func() {
+			defer close(closed)
+			_, _ = io.Copy(io.Discard, b) // not actionable: ends when the connection closes the pipe
+		}()
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+
+		start := time.Now()
+		client, err := Dial(ctx, a, nil)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Nil(t, client)
+		assert.Equal(t, time.Second, time.Since(start))
+		<-closed
 	})
 }
 

@@ -41,12 +41,12 @@ func TestServer_WebSocket(t *testing.T) {
 				if err != nil {
 					return nil, err
 				}
-				return ServerMessages(gorillaConn{ws}, nil)
+				return ServerMessages(r.Context(), gorillaConn{ws}, nil)
 			},
-			dial: func(t *testing.T, _ context.Context, url string) (*Conn, error) {
+			dial: func(t *testing.T, ctx context.Context, url string) (*Conn, error) {
 				ws, _, err := gorillaws.DefaultDialer.Dial(url, nil)
 				require.NoError(t, err)
-				return DialMessages(gorillaConn{ws}, nil)
+				return DialMessages(ctx, gorillaConn{ws}, nil)
 			},
 		},
 		"gorilla, as a byte stream": {
@@ -55,12 +55,12 @@ func TestServer_WebSocket(t *testing.T) {
 				if err != nil {
 					return nil, err
 				}
-				return Server(NetConn(gorillaConn{ws}), nil)
+				return Server(r.Context(), NetConn(gorillaConn{ws}), nil)
 			},
-			dial: func(t *testing.T, _ context.Context, url string) (*Conn, error) {
+			dial: func(t *testing.T, ctx context.Context, url string) (*Conn, error) {
 				ws, _, err := gorillaws.DefaultDialer.Dial(url, nil)
 				require.NoError(t, err)
-				return Dial(NetConn(gorillaConn{ws}), nil)
+				return Dial(ctx, NetConn(gorillaConn{ws}), nil)
 			},
 		},
 		"coder, as a byte stream": {
@@ -71,12 +71,12 @@ func TestServer_WebSocket(t *testing.T) {
 				}
 				// The connection outlives the request's context.
 				ctx := context.WithoutCancel(r.Context())
-				return Server(coderws.NetConn(ctx, ws, coderws.MessageBinary), nil)
+				return Server(r.Context(), coderws.NetConn(ctx, ws, coderws.MessageBinary), nil)
 			},
 			dial: func(t *testing.T, ctx context.Context, url string) (*Conn, error) {
 				ws, _, err := coderws.Dial(ctx, url, nil)
 				require.NoError(t, err)
-				return Dial(coderws.NetConn(ctx, ws, coderws.MessageBinary), nil)
+				return Dial(ctx, coderws.NetConn(ctx, ws, coderws.MessageBinary), nil)
 			},
 		},
 	}

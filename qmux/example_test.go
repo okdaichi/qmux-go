@@ -23,7 +23,7 @@ func Example() {
 		if err != nil {
 			return
 		}
-		sess, err := qmux.Server(conn, nil)
+		sess, err := qmux.Server(context.Background(), conn, nil)
 		if err != nil {
 			return
 		}
@@ -48,7 +48,7 @@ func Example() {
 		fmt.Println(err)
 		return
 	}
-	sess, err := qmux.Dial(conn, nil)
+	sess, err := qmux.Dial(context.Background(), conn, nil)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -84,7 +84,7 @@ func ExampleServerMessages() {
 	// the application protocol and the QMux draft, such as "qmux-02.myapp".
 	var mc qmux.MessageConn
 
-	sess, err := qmux.ServerMessages(mc, nil)
+	sess, err := qmux.ServerMessages(context.Background(), mc, nil)
 	if err != nil {
 		return
 	}

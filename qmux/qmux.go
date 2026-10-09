@@ -1,6 +1,7 @@
 package qmux
 
 import (
+	"context"
 	"net"
 	"time"
 
@@ -127,36 +128,57 @@ func streamLimit(v, def int64) int64 {
 }
 
 // Dial starts a QMux connection as the client over conn, an established
-// byte stream such as a TLS connection. It returns without waiting for the
-// peer: operations on the connection wait for the peer's transport
-// parameters as they need them. The connection owns conn from here on.
+// byte stream such as a TLS connection, and waits for the peer's transport
+// parameters. The connection owns conn from here on: Dial closes it when it
+// fails. ctx bounds the wait, along with Config.HandshakeIdleTimeout; the
+// connection does not keep it.
 //
 // QMux does not negotiate the application protocol. The transport must
 // have, for example with ALPN.
-func Dial(conn net.Conn, config *Config) (*Conn, error) {
+func Dial(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	cfg := config.normalized()
-	return newConn(newStreamTransport(conn, cfg.MaxRecordSize), cfg, false), nil
+	return start(ctx, newStreamTransport(conn, cfg.MaxRecordSize), cfg, false)
 }
 
 // Server starts a QMux connection as the server over conn. See Dial.
-func Server(conn net.Conn, config *Config) (*Conn, error) {
+func Server(ctx context.Context, conn net.Conn, config *Config) (*Conn, error) {
 	cfg := config.normalized()
-	return newConn(newStreamTransport(conn, cfg.MaxRecordSize), cfg, true), nil
+	return start(ctx, newStreamTransport(conn, cfg.MaxRecordSize), cfg, true)
 }
 
 // DialMessages starts a QMux connection as the client over a message
 // transport, sending one record per message. The message boundary delimits
 // the record, so the record's Size field is not sent. This is the mapping
 // that QMux implementations use over WebSocket, where the negotiated
-// subprotocol names the application protocol and the QMux draft.
-func DialMessages(mc MessageConn, config *Config) (*Conn, error) {
+// subprotocol names the application protocol and the QMux draft. See Dial
+// for ctx.
+func DialMessages(ctx context.Context, mc MessageConn, config *Config) (*Conn, error) {
 	cfg := config.normalized()
-	return newConn(&messageTransport{mc: mc, max: cfg.MaxRecordSize}, cfg, false), nil
+	return start(ctx, &messageTransport{mc: mc, max: cfg.MaxRecordSize}, cfg, false)
 }
 
 // ServerMessages starts a QMux connection as the server over a message
 // transport. See DialMessages.
-func ServerMessages(mc MessageConn, config *Config) (*Conn, error) {
+func ServerMessages(ctx context.Context, mc MessageConn, config *Config) (*Conn, error) {
 	cfg := config.normalized()
-	return newConn(&messageTransport{mc: mc, max: cfg.MaxRecordSize}, cfg, true), nil
+	return start(ctx, &messageTransport{mc: mc, max: cfg.MaxRecordSize}, cfg, true)
+}
+
+// start runs a connection over tr until the peer's transport parameters
+// are in. Both endpoints send theirs at once, so neither waits on the
+// other's.
+func start(ctx context.Context, tr recordTransport, config Config, isServer bool) (*Conn, error) {
+	c := newConn(tr, config, isServer)
+	select {
+	case <-c.handshake:
+		// Also closed when the connection ends without the parameters.
+		if err := context.Cause(c.ctx); err != nil {
+			return nil, err
+		}
+		return c, nil
+	case <-ctx.Done():
+		err := context.Cause(ctx)
+		c.abort(err)
+		return nil, err
+	}
 }
