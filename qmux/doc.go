@@ -10,13 +10,16 @@ mirrors that of a quic-go connection:
 
 	// Server
 	conn, _ := ln.Accept()
-	sess, _ := qmux.Server(conn, nil)
+	sess, _ := qmux.Server(ctx, conn, nil)
 	stream, _ := sess.AcceptStream(ctx)
 
 	// Client
 	conn, _ := tls.Dial("tcp", addr, tlsConfig)
-	sess, _ := qmux.Dial(conn, nil)
+	sess, _ := qmux.Dial(ctx, conn, nil)
 	stream, _ := sess.OpenStreamSync(ctx)
+
+Dial and Server return once the peer's transport parameters are in, as
+quic-go's return once the handshake is done.
 
 # Application protocol
 
@@ -44,7 +47,7 @@ over WebSocket.
 		return c.Conn.WriteMessage(websocket.BinaryMessage, p)
 	}
 
-	sess, _ := qmux.ServerMessages(wsConn{ws}, nil)
+	sess, _ := qmux.ServerMessages(ctx, wsConn{ws}, nil)
 
 NetConn adapts a MessageConn to a net.Conn instead, for peers that treat the
 messages as a plain byte stream.
@@ -52,7 +55,8 @@ messages as a plain byte stream.
 # Differences from QUIC
 
 All streams share one ordered transport: a lost segment delays every stream,
-and a datagram, once sent, is delivered reliably. Stream priorities are not
-implemented.
+and a datagram, once sent, is delivered reliably. Stream priorities order the
+writes that wait for the transport; what the transport already holds is sent
+in the order it was written.
 */
 package qmux
