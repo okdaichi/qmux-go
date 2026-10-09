@@ -6,6 +6,7 @@ import (
 
 	"github.com/okdaichi/qmux-go/qmux/internal/wire"
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 // StreamID is a 62-bit integer as defined in QUIC.
@@ -25,7 +26,8 @@ const (
 type Config struct {
 	// MaxIncomingStreams is the number of bidirectional streams the peer
 	// may have open at a time. The default is 100; a negative value allows
-	// none.
+	// none. The peer can open that many with a single frame, so the limit
+	// also bounds the memory a peer can claim.
 	MaxIncomingStreams int64
 	// MaxIncomingUniStreams is the number of unidirectional streams the
 	// peer may have open at a time. The default is 100; a negative value
@@ -77,7 +79,10 @@ func (c *Config) normalized() Config {
 	if n.InitialConnectionReceiveWindow == 0 {
 		n.InitialConnectionReceiveWindow = defaultConnectionReceiveWindow
 	}
-	n.MaxRecordSize = max(n.MaxRecordSize, wire.DefaultMaxRecordSize)
+	// Transport parameters are variable-length integers.
+	n.InitialStreamReceiveWindow = min(n.InitialStreamReceiveWindow, quicvarint.Max)
+	n.InitialConnectionReceiveWindow = min(n.InitialConnectionReceiveWindow, quicvarint.Max)
+	n.MaxRecordSize = min(max(n.MaxRecordSize, wire.DefaultMaxRecordSize), quicvarint.Max)
 	if n.MaxIdleTimeout == 0 {
 		n.MaxIdleTimeout = defaultMaxIdleTimeout
 	}

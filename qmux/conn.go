@@ -22,6 +22,14 @@ const (
 	maxControlFrameSize = 32
 
 	datagramQueueSize = 100
+
+	// maxReasonLength keeps a CONNECTION_CLOSE frame within a record of
+	// the default size.
+	maxReasonLength = wire.DefaultMaxRecordSize - maxControlFrameSize
+
+	// maxIdleTimeout is the longest idle timeout a peer can declare that
+	// still fits a time.Duration.
+	maxIdleTimeout = time.Duration(1<<63 - 1)
 )
 
 // signal wakes the goroutines waiting for a state change. The connection's
@@ -117,12 +125,16 @@ type Conn struct {
 	pingPending    bool
 	controlWake    chan struct{}
 
-	idleTimeout  time.Duration
-	nextPing     uint64 // sequence number of the next QX_PING request
-	pingSentAt   time.Time
-	peerPinged   bool
-	peerPingLast uint64
-	rtt          rttStats
+	idleTimeout time.Duration
+	nextPing    uint64 // sequence number of the next QX_PING request
+	pingSentAt  time.Time
+	// pingUnanswered is set while the latest request has no response, and
+	// pingUnansweredAt is when the first such request was sent.
+	pingUnanswered   bool
+	pingUnansweredAt time.Time
+	peerPinged       bool
+	peerPingLast     uint64
+	rtt              rttStats
 
 	datagrams    chan []byte
 	lastActivity atomic.Int64 // UnixNano of the last record sent or received
@@ -294,6 +306,10 @@ func (c *Conn) takeControl() []wire.Frame {
 		frames = append(frames, &wire.Ping{Sequence: c.nextPing})
 		c.nextPing++
 		c.pingSentAt = time.Now()
+		if !c.pingUnanswered {
+			c.pingUnanswered = true
+			c.pingUnansweredAt = c.pingSentAt
+		}
 	}
 	return frames
 }
@@ -382,11 +398,19 @@ func (c *Conn) currentIdleTimeout() time.Duration {
 	return c.idleTimeout
 }
 
-func (c *Conn) requestPing() {
+// requestPing asks the write loop for a QX_PING. It reports false when the
+// peer has left pings unanswered for the idle timeout: sending resets the
+// idle timer (Section 7.1), so the pings would otherwise keep a connection
+// to a peer that is gone alive until the transport gives up.
+func (c *Conn) requestPing() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.pingUnanswered && c.idleTimeout > 0 && time.Since(c.pingUnansweredAt) >= c.idleTimeout {
+		return false
+	}
 	c.pingPending = true
 	c.wakeWriter()
+	return true
 }
 
 func (c *Conn) keepAliveLoop() {
@@ -395,7 +419,10 @@ func (c *Conn) keepAliveLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			c.requestPing()
+			if !c.requestPing() {
+				c.closeGracefully(&quic.IdleTimeoutError{}, nil)
+				return
+			}
 		case <-c.ctx.Done():
 			return
 		}
@@ -457,9 +484,10 @@ func (c *Conn) closeGracefully(err error, frame *wire.ConnectionClose) {
 }
 
 func (c *Conn) closeWithTransportError(e *wire.Error) {
+	reason := e.Reason[:min(len(e.Reason), maxReasonLength)]
 	c.closeGracefully(
-		&quic.TransportError{ErrorCode: quic.TransportErrorCode(e.Code), ErrorMessage: e.Reason},
-		&wire.ConnectionClose{Code: e.Code, Reason: e.Reason},
+		&quic.TransportError{ErrorCode: quic.TransportErrorCode(e.Code), ErrorMessage: reason},
+		&wire.ConnectionClose{Code: e.Code, Reason: reason},
 	)
 }
 
@@ -471,6 +499,8 @@ func (c *Conn) Close() error {
 // CloseWithError closes the connection with an application error code and a
 // reason. Streams and pending operations fail with a *quic.ApplicationError.
 func (c *Conn) CloseWithError(code ApplicationErrorCode, msg string) error {
+	// The frame has to fit in a record of the default size.
+	msg = msg[:min(len(msg), maxReasonLength)]
 	c.closeGracefully(
 		&quic.ApplicationError{ErrorCode: code, ErrorMessage: msg},
 		&wire.ConnectionClose{Application: true, Code: uint64(code), Reason: msg},
@@ -567,7 +597,9 @@ func (c *Conn) handleParametersLocked(p wire.Parameters) {
 	c.sendMax = p.InitialMaxData
 	c.out[dirBidi].max = p.InitialMaxStreamsBidi
 	c.out[dirUni].max = p.InitialMaxStreamsUni
-	if peerIdle := time.Duration(p.MaxIdleTimeout) * time.Millisecond; peerIdle > 0 {
+	// A timeout too long for a time.Duration is as good as none.
+	if p.MaxIdleTimeout > 0 && p.MaxIdleTimeout <= uint64(maxIdleTimeout/time.Millisecond) {
+		peerIdle := time.Duration(p.MaxIdleTimeout) * time.Millisecond
 		if c.idleTimeout == 0 || peerIdle < c.idleTimeout {
 			c.idleTimeout = peerIdle
 		}
@@ -648,7 +680,7 @@ func (c *Conn) handleStreamLocked(f *wire.Stream) error {
 	if s.readCancelled {
 		c.consumeLocked(n)
 	} else {
-		s.rbuf = append(s.rbuf, f.Data...)
+		s.bufferLocked(f.Data)
 	}
 	s.readSignal.broadcast()
 	c.completeLocked(s)
@@ -665,6 +697,9 @@ func (c *Conn) handleResetStreamLocked(f *wire.ResetStream) error {
 	}
 	if s.recvReset {
 		return nil
+	}
+	if f.FinalSize > s.recvMax {
+		return &wire.Error{Code: wire.FlowControlError, Reason: fmt.Sprintf("stream %d: final size exceeds the flow control limit", f.StreamID)}
 	}
 	// The data that was never sent counts against the connection's limit
 	// all the same (RFC 9000, Section 4.5).
@@ -712,6 +747,7 @@ func (c *Conn) handlePingLocked(f *wire.Ping) error {
 		}
 		if f.Sequence == c.nextPing-1 {
 			c.rtt.update(time.Since(c.pingSentAt))
+			c.pingUnanswered = false
 		}
 		return nil
 	}
@@ -743,7 +779,9 @@ func (s *rttStats) update(rtt time.Duration) {
 }
 
 func (c *Conn) handleDatagramLocked(f *wire.Datagram) error {
-	if uint64(f.Len()) > c.config.MaxDatagramFrameSize {
+	// The frame may come without its Length field, so only the type and
+	// the data are counted.
+	if uint64(1+len(f.Data)) > c.config.MaxDatagramFrameSize {
 		return protocolViolation("DATAGRAM frame larger than max_datagram_frame_size")
 	}
 	select {

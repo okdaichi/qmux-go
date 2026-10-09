@@ -78,6 +78,18 @@ func (c *Conn) newStreamLocked(id StreamID) *stream {
 	return s
 }
 
+// bufferLocked appends received data to the read buffer. The read part of
+// the buffer is reclaimed first when the data would not fit, so that the
+// buffer stays within the flow control window however the application
+// reads.
+func (s *stream) bufferLocked(p []byte) {
+	if s.roff > 0 && len(s.rbuf)+len(p) > cap(s.rbuf) {
+		s.rbuf = s.rbuf[:copy(s.rbuf, s.rbuf[s.roff:])]
+		s.roff = 0
+	}
+	s.rbuf = append(s.rbuf, p...)
+}
+
 func (s *stream) recvDone() bool {
 	if !s.canRecv || s.recvReset {
 		return true
@@ -227,6 +239,9 @@ func (s *stream) trySend() (ok bool, wake, connWake <-chan struct{}, deadline ti
 	defer c.mu.Unlock()
 	if err := s.sendErrLocked(); err != nil {
 		return false, nil, nil, time.Time{}, err
+	}
+	if !s.writeDeadline.IsZero() && !time.Now().Before(s.writeDeadline) {
+		return false, nil, nil, time.Time{}, os.ErrDeadlineExceeded
 	}
 	if s.sendCreditLocked() > 0 {
 		return true, nil, nil, time.Time{}, nil
@@ -415,7 +430,9 @@ func (s *SendStream) CancelWrite(code StreamErrorCode) { s.s.cancelWrite(code) }
 func (s *SendStream) Context() context.Context { return s.s.ctx }
 
 // SetWriteDeadline sets the deadline for Write calls, pending and future.
-// A zero value means no deadline.
+// A zero value means no deadline. The deadline bounds the wait for the
+// peer's flow control; a write that the transport itself holds up ends
+// with the connection's idle timeout.
 func (s *SendStream) SetWriteDeadline(t time.Time) error {
 	s.s.setWriteDeadline(t)
 	return nil

@@ -6,8 +6,10 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -289,6 +291,14 @@ func TestStream_SetDeadline(t *testing.T) {
 	require.NoError(t, s.SetDeadline(time.Now().Add(-time.Second)))
 	_, err = s.Read(make([]byte, 1))
 	assert.ErrorIs(t, err, os.ErrDeadlineExceeded)
+
+	// A deadline that has passed fails a write that flow control allows.
+	fresh, err := client.OpenStreamSync(ctx)
+	require.NoError(t, err)
+	require.NoError(t, fresh.SetWriteDeadline(time.Now().Add(-time.Second)))
+	n, err = fresh.Write([]byte("late"))
+	assert.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	assert.Zero(t, n)
 }
 
 func TestSendStream_Context(t *testing.T) {
@@ -563,6 +573,9 @@ func TestConn_handleRecord_ProtocolError(t *testing.T) {
 			)},
 			code: wire.FinalSizeError,
 		},
+		"reset beyond the stream window": {
+			records: [][]byte{frames(&wire.ResetStream{StreamID: 0, FinalSize: 1025})}, code: wire.FlowControlError,
+		},
 		"frame for a stream that was not opened": {
 			records: [][]byte{frames(&wire.MaxStreamData{StreamID: 1, Max: 10})}, code: wire.StreamStateError,
 		},
@@ -728,6 +741,17 @@ func TestConfig_normalized(t *testing.T) {
 				MaxRecordSize: 16382, MaxIdleTimeout: 0,
 			},
 		},
+		"windows beyond a variable-length integer": {
+			config: &Config{
+				InitialStreamReceiveWindow: math.MaxUint64, InitialConnectionReceiveWindow: math.MaxUint64,
+				MaxRecordSize: math.MaxUint64,
+			},
+			expected: Config{
+				MaxIncomingStreams: 100, MaxIncomingUniStreams: 100,
+				InitialStreamReceiveWindow: 1<<62 - 1, InitialConnectionReceiveWindow: 1<<62 - 1,
+				MaxRecordSize: 1<<62 - 1, MaxIdleTimeout: 30 * time.Second,
+			},
+		},
 		"datagrams": {
 			config: &Config{EnableDatagrams: true, MaxDatagramFrameSize: 1 << 20, MaxRecordSize: 20000},
 			expected: Config{
@@ -743,4 +767,106 @@ func TestConfig_normalized(t *testing.T) {
 			assert.Equal(t, tt.expected, tt.config.normalized())
 		})
 	}
+}
+
+// A reader that never empties the buffer must not make it grow past the
+// flow control window.
+func TestStream_Read_BufferBounded(t *testing.T) {
+	const window = 16 * 1024
+	config := &Config{InitialStreamReceiveWindow: window}
+	client, server := newTestPair(t, config, config)
+	ctx := testContext(t)
+
+	s, err := client.OpenUniStreamSync(ctx)
+	require.NoError(t, err)
+	go func() {
+		if _, err := s.Write(make([]byte, 2<<20)); err != nil {
+			return
+		}
+		assert.NoError(t, s.Close())
+	}()
+
+	r, err := server.AcceptUniStream(ctx)
+	require.NoError(t, err)
+	largest, total := 0, 0
+	buf := make([]byte, 512)
+	for {
+		n, err := r.Read(buf)
+		total += n
+		if err != nil {
+			require.ErrorIs(t, err, io.EOF)
+			break
+		}
+		server.mu.Lock()
+		largest = max(largest, cap(r.s.rbuf))
+		server.mu.Unlock()
+	}
+	assert.Equal(t, 2<<20, total)
+	assert.LessOrEqual(t, largest, 2*window)
+}
+
+// Pings that go unanswered must not keep a connection to a dead peer open:
+// sending them resets the idle timer.
+func TestConn_keepAliveLoop_DeadPeer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		a, b := net.Pipe()
+		client, err := Dial(a, &Config{MaxIdleTimeout: 100 * time.Millisecond, KeepAlivePeriod: 20 * time.Millisecond})
+		require.NoError(t, err)
+
+		// The peer sends its transport parameters, then reads and never
+		// answers.
+		go func() {
+			params := (&wire.TransportParameters{}).Append(nil)
+			if _, err := b.Write(append(quicvarint.Append(nil, uint64(len(params))), params...)); err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, b) // not actionable: ends when the connection closes the pipe
+		}()
+
+		start := time.Now()
+		<-client.Context().Done()
+		var idle *quic.IdleTimeoutError
+		assert.ErrorAs(t, context.Cause(client.Context()), &idle)
+		// The first ping goes out at 20ms and is 100ms old at 120ms.
+		assert.Equal(t, 120*time.Millisecond, time.Since(start))
+		client.loops.Wait()
+	})
+}
+
+// A DATAGRAM frame without a length may be as large as the limit.
+func TestConn_ReceiveDatagram_WithoutLength(t *testing.T) {
+	server, peer := newRawPeer(t, &Config{EnableDatagrams: true})
+	require.IsType(t, &wire.TransportParameters{}, peer.next(t))
+
+	peer.write(t, (&wire.TransportParameters{}).Append(nil))
+	peer.write(t, append([]byte{0x30}, make([]byte, 1199)...))
+
+	got, err := server.ReceiveDatagram(testContext(t))
+	require.NoError(t, err)
+	assert.Len(t, got, 1199)
+}
+
+// An idle timeout too long for a time.Duration leaves the local one alone.
+func TestConn_handleRecord_HugeIdleTimeout(t *testing.T) {
+	server, peer := newRawPeer(t, &Config{MaxIdleTimeout: time.Minute})
+	require.IsType(t, &wire.TransportParameters{}, peer.next(t))
+
+	peer.write(t, (&wire.TransportParameters{Parameters: wire.Parameters{MaxIdleTimeout: 1<<62 - 1}}).Append(nil))
+
+	<-server.handshake
+	assert.Equal(t, time.Minute, server.currentIdleTimeout())
+}
+
+// A reason too long for a record is cut, so that the peer still gets the
+// error code.
+func TestConn_CloseWithError_LongReason(t *testing.T) {
+	client, server := newTestPair(t, nil, nil)
+
+	require.NoError(t, client.CloseWithError(3, strings.Repeat("x", 40000)))
+
+	<-server.Context().Done()
+	var remote *quic.ApplicationError
+	require.ErrorAs(t, context.Cause(server.Context()), &remote)
+	assert.Equal(t, ApplicationErrorCode(3), remote.ErrorCode)
+	assert.Len(t, remote.ErrorMessage, maxReasonLength)
 }
