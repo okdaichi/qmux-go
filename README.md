@@ -6,16 +6,18 @@
 
 `qmux-go` is a Go implementation of the **QMux protocol**, providing QUIC-like stream and datagram multiplexing semantics over any reliable, bi-directional byte stream transport, such as TCP, TLS, or WebSockets.
 
-Following the **[draft-ietf-quic-qmux-01](https://www.ietf.org/archive/id/draft-ietf-quic-qmux-01.html)** specification, `qmux-go` allows developers to leverage the power of QUIC's multiplexing features even when restricted to non-UDP transports.
+It follows **[draft-ietf-quic-qmux-02](https://www.ietf.org/archive/id/draft-ietf-quic-qmux-02.html)**, and interoperates with [`@moq/qmux`](https://www.npmjs.com/package/@moq/qmux) over WebSocket.
 
 ## Features
 
-- **Full Specification Compliance**: Implements all mandatory and optional features of QMux draft-01.
-- **Multiplexing Engine**: Supports bi-directional and uni-directional streams with QUIC-style stream ID management.
-- **Flow Control**: Sophisticated connection-level and stream-level flow control.
-- **Unreliable Datagrams**: Supports the `DATAGRAM` extension (RFC 9221).
-- **Transport Agnostic**: Works over raw `net.Conn` and provides a generic `MessageConn` adapter for WebSockets.
-- **In-band Negotiation**: Handshake-based negotiation of transport parameters and application-level protocols.
+- **Streams**: bidirectional and unidirectional, with QUIC's stream limits, flow control, resets, deadlines and priorities (RFC 9218).
+- **Datagrams**: the `DATAGRAM` extension (RFC 9221), delivered reliably and in order as QMux specifies.
+- **Transports**: any `net.Conn` (TCP, TLS, Unix sockets), or a message transport such as WebSocket with one record per message (`DialMessages`, `ServerMessages`).
+- **quic-go shaped API**: `Conn` and its streams mirror quic-go's, and report errors with its error types.
+
+QMux does not negotiate the application protocol: the transport does, with ALPN over TLS or the subprotocol over WebSocket (for example `qmux-02.myapp`).
+
+Not implemented: `RESET_STREAM_AT`, 0-RTT, and flow control window auto-tuning.
 
 ## Installation
 
@@ -26,8 +28,6 @@ go get github.com/okdaichi/qmux-go
 ## Documentation & Examples
 
 For detailed API documentation and runnable examples, please visit the **[Go Reference](https://pkg.go.dev/github.com/okdaichi/qmux-go/qmux)**. 
-
-Code samples for common scenarios (TCP, TLS, and WebSockets) can be found in the [examples/](examples/) directory.
 
 ## License
 

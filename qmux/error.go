@@ -1,10 +1,14 @@
 package qmux
 
 import (
+	"errors"
+
 	"github.com/quic-go/quic-go"
 )
 
-// TransportErrorCode is a QUIC transport error code.
+// TransportErrorCode is a QUIC transport error code. quic-go names the
+// codes: quic.ProtocolViolation, quic.FlowControlError and so on. A
+// connection that ends on one fails with a *quic.TransportError.
 type TransportErrorCode = quic.TransportErrorCode
 
 // ApplicationErrorCode is a QUIC application error code.
@@ -13,27 +17,6 @@ type ApplicationErrorCode = quic.ApplicationErrorCode
 // StreamErrorCode is a QUIC stream error code.
 type StreamErrorCode = quic.StreamErrorCode
 
-const (
-	// NoError is a QUIC transport error code.
-	NoError = quic.NoError
-	
-	// ProtocolViolation is a QUIC transport error code.
-	// Since quic-go doesn't export the constant name but uses the type, 
-	// we keep our own definitions for standard QUIC error codes used by QMux.
-	InternalError             TransportErrorCode = 0x01
-	ConnectionRefused         TransportErrorCode = 0x02
-	FlowControlError          TransportErrorCode = 0x03
-	StreamLimitError          TransportErrorCode = 0x04
-	StreamStateError          TransportErrorCode = 0x05
-	FinalSizeError            TransportErrorCode = 0x06
-	FrameEncodingError        TransportErrorCode = 0x07
-	TransportParameterError   TransportErrorCode = 0x08
-	ConnectionIDLimitError    TransportErrorCode = 0x09
-	ProtocolViolationError    TransportErrorCode = 0x0a
-	InvalidTokenError         TransportErrorCode = 0x0b
-	ApplicationError          TransportErrorCode = 0x0c
-	CryptoBufferExceeded      TransportErrorCode = 0x0d
-	KeyUpdateError            TransportErrorCode = 0x0e
-	AEADLimitReached          TransportErrorCode = 0x0f
-	NoViablePath              TransportErrorCode = 0x10
-)
+// ErrDatagramsNotSupported is returned by SendDatagram when the peer does
+// not accept datagrams.
+var ErrDatagramsNotSupported = errors.New("qmux: peer does not accept datagrams")

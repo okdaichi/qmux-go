@@ -1,450 +1,570 @@
 package qmux
 
 import (
-	"bytes"
 	"context"
-	"errors"
+	"fmt"
 	"io"
-	"sync"
-	"sync/atomic"
+	"os"
 	"time"
 
 	"github.com/okdaichi/qmux-go/qmux/internal/wire"
 	"github.com/quic-go/quic-go"
 )
 
-type receiveSide struct {
-	readBuffer    bytes.Buffer
-	readChan      chan struct{}
-	receiveFC     *flowController
-	receiveOffset atomic.Uint64
-	receiveClosed atomic.Bool
-	receiveError  error
+// maxStreamData is the most stream data that fits in a record of the
+// default size, which every peer accepts.
+const maxStreamData = wire.DefaultMaxRecordSize - wire.StreamOverhead
+
+// stream is the state of one stream. The connection's mutex guards it.
+type stream struct {
+	c  *Conn
+	id StreamID
+
+	// ctx ends with the sending side. It is nil on a receive-only stream.
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+
+	accepted bool // the application holds the stream
+	done     bool // both directions have ended; the connection forgot it
+
+	canRecv       bool
+	rbuf          []byte // received data; rbuf[roff:] is unread
+	roff          int
+	recvOffset    uint64 // data received from the peer
+	recvMax       uint64 // the limit declared to the peer
+	readOffset    uint64 // data read by the application
+	finRecv       bool
+	recvReset     bool  // the peer reset the stream
+	readCancelled bool  // the application cancelled reading
+	recvErr       error // what Read returns after a reset or a cancel
 	readDeadline  time.Time
-}
+	readSignal    signal
 
-type sendSide struct {
-	sendOffset    atomic.Uint64
-	sendClosed    atomic.Bool
-	sendError     error
-	sendFC        *flowController
-	writeChan     chan struct{}
+	canSend       bool
+	urgency       int8
+	incremental   bool
+	sendOffset    uint64
+	sendMax       uint64 // the peer's limit
+	finSent       bool
+	sendErr       error // what Write returns after a reset
 	writeDeadline time.Time
+	writeSignal   signal
 }
 
-type baseStream struct {
-	id      StreamID
-	session *Conn
-
-	ctx       context.Context
-	cancelCtx context.CancelFunc
-
-	mutex sync.Mutex
-
-	receive receiveSide
-	send    sendSide
-}
-
-func newBaseStream(id StreamID, sess *Conn, initialSendWindow, initialReceiveWindow uint64) *baseStream {
-	ctx, cancel := context.WithCancel(sess.ctx)
-	return &baseStream{
-		id:        id,
-		session:   sess,
-		ctx:       ctx,
-		cancelCtx: cancel,
-		receive: receiveSide{
-			readChan:  make(chan struct{}, 1),
-			receiveFC: newFlowController(initialReceiveWindow),
-		},
-		send: sendSide{
-			writeChan: make(chan struct{}, 1),
-			sendFC:    newFlowController(initialSendWindow),
-		},
+// newStreamLocked creates the state of a stream that the peer's transport
+// parameters allow: they are in by the time either side opens one.
+func (c *Conn) newStreamLocked(id StreamID) *stream {
+	local := c.initiatedLocally(id)
+	uni := streamDir(id) == dirUni
+	s := &stream{
+		c:       c,
+		id:      id,
+		canRecv: !uni || !local,
+		canSend: !uni || local,
 	}
+	if s.canRecv {
+		s.recvMax = c.config.InitialStreamReceiveWindow
+	}
+	if s.canSend {
+		s.urgency, s.incremental = defaultUrgency, true
+		s.ctx, s.cancel = context.WithCancelCause(c.ctx)
+		switch {
+		case uni:
+			s.sendMax = c.peer.InitialMaxStreamDataUni
+		case local:
+			s.sendMax = c.peer.InitialMaxStreamDataBidiRemote
+		default:
+			s.sendMax = c.peer.InitialMaxStreamDataBidiLocal
+		}
+	}
+	c.streams[id] = s
+	return s
 }
 
-// ReceiveStream is a unidirectional receive-only stream.
-type ReceiveStream struct {
-	*baseStream
+// bufferLocked appends received data to the read buffer. The read part of
+// the buffer is reclaimed first when the data would not fit, so that the
+// buffer stays within the flow control window however the application
+// reads.
+func (s *stream) bufferLocked(p []byte) {
+	if s.roff > 0 && len(s.rbuf)+len(p) > cap(s.rbuf) {
+		s.rbuf = s.rbuf[:copy(s.rbuf, s.rbuf[s.roff:])]
+		s.roff = 0
+	}
+	s.rbuf = append(s.rbuf, p...)
 }
 
-func (s *ReceiveStream) Read(p []byte) (int, error) { return s.baseStream.read(p) }
-func (s *ReceiveStream) CancelRead(code StreamErrorCode) { s.baseStream.cancelRead(code) }
-func (s *ReceiveStream) StreamID() StreamID { return s.baseStream.id }
-func (s *ReceiveStream) SetReadDeadline(t time.Time) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.receive.readDeadline = t
+func (s *stream) recvDone() bool {
+	if !s.canRecv || s.recvReset {
+		return true
+	}
+	return s.finRecv && (s.readCancelled || s.roff == len(s.rbuf))
+}
+
+func (s *stream) sendDone() bool {
+	return !s.canSend || s.finSent || s.sendErr != nil
+}
+
+// wait blocks until wake or other is closed. It fails once the deadline,
+// when set, has passed.
+func wait(deadline time.Time, wake, other <-chan struct{}) error {
+	var expired <-chan time.Time
+	if !deadline.IsZero() {
+		d := time.Until(deadline)
+		if d <= 0 {
+			return os.ErrDeadlineExceeded
+		}
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		expired = timer.C
+	}
+	select {
+	case <-wake:
+	case <-other:
+	case <-expired:
+		return os.ErrDeadlineExceeded
+	}
 	return nil
 }
 
-// SendStream is a unidirectional send-only stream.
-type SendStream struct {
-	*baseStream
+func (s *stream) read(p []byte) (int, error) {
+	for {
+		n, wake, deadline, err := s.tryRead(p)
+		if n > 0 || err != nil || len(p) == 0 {
+			return n, err
+		}
+		if err := wait(deadline, wake, nil); err != nil {
+			return 0, err
+		}
+	}
 }
 
-func (s *SendStream) Write(p []byte) (int, error) { return s.baseStream.write(p) }
-func (s *SendStream) Close() error { return s.baseStream.close() }
-func (s *SendStream) CancelWrite(code StreamErrorCode) { s.baseStream.cancelWrite(code) }
-func (s *SendStream) StreamID() StreamID { return s.baseStream.id }
+// tryRead copies received data to p. With none to copy and no error, it
+// returns a channel that is closed when the stream's state changes.
+func (s *stream) tryRead(p []byte) (int, <-chan struct{}, time.Time, error) {
+	c := s.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case c.closeErr != nil:
+		return 0, nil, time.Time{}, c.closeErr
+	case s.recvErr != nil:
+		return 0, nil, time.Time{}, s.recvErr
+	}
+	if s.roff < len(s.rbuf) {
+		n := copy(p, s.rbuf[s.roff:])
+		s.roff += n
+		if s.roff == len(s.rbuf) {
+			s.rbuf, s.roff = s.rbuf[:0], 0
+		}
+		s.readLocked(uint64(n))
+		c.completeLocked(s)
+		return n, nil, time.Time{}, nil
+	}
+	if s.finRecv {
+		return 0, nil, time.Time{}, io.EOF
+	}
+	return 0, s.readSignal.wait(), s.readDeadline, nil
+}
+
+func (s *stream) peek(p []byte) (int, error) {
+	// Peeked data stays in the buffer, so no more than a window of it can
+	// ever be there.
+	if window := s.c.config.InitialStreamReceiveWindow; uint64(len(p)) > window {
+		return 0, fmt.Errorf("qmux: peek of %d bytes exceeds the stream window of %d", len(p), window)
+	}
+	for {
+		n, wake, deadline, err := s.tryPeek(p)
+		if wake == nil {
+			return n, err
+		}
+		if err := wait(deadline, wake, nil); err != nil {
+			return 0, err
+		}
+	}
+}
+
+// tryPeek copies received data to p without consuming it, once there is
+// enough to fill p or the stream has ended. Until then it returns a channel
+// that is closed when the stream's state changes.
+func (s *stream) tryPeek(p []byte) (int, <-chan struct{}, time.Time, error) {
+	c := s.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case c.closeErr != nil:
+		return 0, nil, time.Time{}, c.closeErr
+	case s.recvErr != nil:
+		return 0, nil, time.Time{}, s.recvErr
+	}
+	unread := s.rbuf[s.roff:]
+	switch {
+	case len(unread) >= len(p):
+		return copy(p, unread), nil, time.Time{}, nil
+	case s.finRecv:
+		return copy(p, unread), nil, time.Time{}, io.EOF
+	}
+	return 0, s.readSignal.wait(), s.readDeadline, nil
+}
+
+// readLocked accounts for data the application has read, and extends the
+// stream's limit once half the window is used.
+func (s *stream) readLocked(n uint64) {
+	c := s.c
+	s.readOffset += n
+	c.consumeLocked(n)
+	window := c.config.InitialStreamReceiveWindow
+	if !s.finRecv && s.recvMax-s.readOffset < window/2 {
+		s.recvMax = s.readOffset + window
+		c.queueLocked(&wire.MaxStreamData{StreamID: uint64(s.id), Max: s.recvMax})
+	}
+}
+
+func (s *stream) cancelRead(code StreamErrorCode) {
+	c := s.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closeErr != nil || s.recvErr != nil || s.recvDone() {
+		return
+	}
+	s.readCancelled = true
+	s.recvErr = &quic.StreamError{StreamID: s.id, ErrorCode: code}
+	c.consumeLocked(uint64(len(s.rbuf) - s.roff))
+	s.rbuf, s.roff = nil, 0
+	if !s.finRecv {
+		c.queueLocked(&wire.StopSending{StreamID: uint64(s.id), Code: uint64(code)})
+	}
+	s.readSignal.broadcast()
+	c.completeLocked(s)
+}
+
+func (s *stream) write(p []byte) (int, error) {
+	total := 0
+	for total < len(p) {
+		if err := s.waitSendCredit(); err != nil {
+			return total, err
+		}
+		n, err := s.writeChunk(p[total:])
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+// sendErrLocked returns why the stream cannot send, if it cannot.
+func (s *stream) sendErrLocked() error {
+	switch {
+	case s.c.closeErr != nil:
+		return s.c.closeErr
+	case s.sendErr != nil:
+		return s.sendErr
+	case s.finSent:
+		return fmt.Errorf("qmux: write on closed stream %d", s.id)
+	}
+	return nil
+}
+
+// sendCreditLocked returns how much data flow control lets the stream send.
+func (s *stream) sendCreditLocked() uint64 {
+	c := s.c
+	if s.sendMax <= s.sendOffset || c.sendMax <= c.sent {
+		return 0
+	}
+	return min(s.sendMax-s.sendOffset, c.sendMax-c.sent)
+}
+
+// trySend reports whether the stream has flow control credit. Without any,
+// it returns the channels that are closed when that may have changed.
+func (s *stream) trySend() (ok bool, wake, connWake <-chan struct{}, deadline time.Time, err error) {
+	c := s.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := s.sendErrLocked(); err != nil {
+		return false, nil, nil, time.Time{}, err
+	}
+	if !s.writeDeadline.IsZero() && !time.Now().Before(s.writeDeadline) {
+		return false, nil, nil, time.Time{}, os.ErrDeadlineExceeded
+	}
+	if s.sendCreditLocked() > 0 {
+		return true, nil, nil, time.Time{}, nil
+	}
+	return false, s.writeSignal.wait(), c.sendSignal.wait(), s.writeDeadline, nil
+}
+
+func (s *stream) waitSendCredit() error {
+	for {
+		ok, wake, connWake, deadline, err := s.trySend()
+		if ok || err != nil {
+			return err
+		}
+		if err := wait(deadline, wake, connWake); err != nil {
+			return err
+		}
+	}
+}
+
+// reserve takes flow control credit for as much of n bytes as it can, and
+// returns the offset to send them at.
+func (s *stream) reserve(n int) (offset uint64, reserved int, err error) {
+	c := s.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := s.sendErrLocked(); err != nil {
+		return 0, 0, err
+	}
+	reserved = int(min(uint64(n), maxStreamData, s.sendCreditLocked()))
+	offset = s.sendOffset
+	s.sendOffset += uint64(reserved)
+	c.sent += uint64(reserved)
+	return offset, reserved, nil
+}
+
+func (s *stream) setPriority(urgency int8, incremental bool) {
+	s.c.mu.Lock()
+	defer s.c.mu.Unlock()
+	s.urgency = min(max(urgency, 0), maxUrgency)
+	s.incremental = incremental
+}
+
+func (s *stream) priority() priority {
+	s.c.mu.Lock()
+	defer s.c.mu.Unlock()
+	return priority{urgency: s.urgency, incremental: s.incremental, streamID: s.id}
+}
+
+// writeChunk sends the start of p in one record. It may send nothing when
+// another stream took the connection's credit first.
+func (s *stream) writeChunk(p []byte) (int, error) {
+	c := s.c
+	c.writeMu.LockPriority(s.priority())
+	defer c.writeMu.Unlock()
+	offset, n, err := s.reserve(len(p))
+	if err != nil || n == 0 {
+		return 0, err
+	}
+	// The data is copied into the record here, so p is not retained.
+	if err := c.writeFramesLocked(&wire.Stream{StreamID: uint64(s.id), Offset: offset, Data: p[:n]}); err != nil {
+		c.abort(fmt.Errorf("qmux: write to transport: %w", err))
+		return 0, context.Cause(c.ctx)
+	}
+	return n, nil
+}
+
+// finish marks the sending side as ended and returns the final size. It
+// reports false when there is nothing left to send: the stream has already
+// ended, or was reset.
+func (s *stream) finish() (finalSize uint64, ok bool, err error) {
+	c := s.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closeErr != nil {
+		return 0, false, c.closeErr
+	}
+	if s.finSent || s.sendErr != nil {
+		return 0, false, nil
+	}
+	s.finSent = true
+	s.cancel(nil)
+	s.writeSignal.broadcast()
+	c.completeLocked(s)
+	return s.sendOffset, true, nil
+}
+
+func (s *stream) closeSend() error {
+	c := s.c
+	c.writeMu.LockPriority(s.priority())
+	defer c.writeMu.Unlock()
+	finalSize, ok, err := s.finish()
+	if !ok {
+		return err
+	}
+	if err := c.writeFramesLocked(&wire.Stream{StreamID: uint64(s.id), Offset: finalSize, Fin: true}); err != nil {
+		c.abort(fmt.Errorf("qmux: write to transport: %w", err))
+		return context.Cause(c.ctx)
+	}
+	return nil
+}
+
+func (s *stream) cancelWrite(code StreamErrorCode) {
+	c := s.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closeErr != nil {
+		return
+	}
+	s.resetSendLocked(&quic.StreamError{StreamID: s.id, ErrorCode: code})
+}
+
+// stopSendingLocked handles the peer's STOP_SENDING: the stream is reset
+// with the peer's error code (RFC 9000, Section 3.5).
+func (s *stream) stopSendingLocked(code StreamErrorCode) {
+	s.resetSendLocked(&quic.StreamError{StreamID: s.id, ErrorCode: code, Remote: true})
+}
+
+func (s *stream) resetSendLocked(reason *quic.StreamError) {
+	if s.sendDone() {
+		return
+	}
+	c := s.c
+	s.sendErr = reason
+	s.cancel(reason)
+	c.queueLocked(&wire.ResetStream{StreamID: uint64(s.id), Code: uint64(reason.ErrorCode), FinalSize: s.sendOffset})
+	s.writeSignal.broadcast()
+	c.completeLocked(s)
+}
+
+func (s *stream) setReadDeadline(t time.Time) {
+	s.c.mu.Lock()
+	defer s.c.mu.Unlock()
+	s.readDeadline = t
+	s.readSignal.broadcast()
+}
+
+func (s *stream) setWriteDeadline(t time.Time) {
+	s.c.mu.Lock()
+	defer s.c.mu.Unlock()
+	s.writeDeadline = t
+	s.writeSignal.broadcast()
+}
+
+var (
+	_ io.Reader          = (*ReceiveStream)(nil)
+	_ io.WriteCloser     = (*SendStream)(nil)
+	_ io.ReadWriteCloser = (*Stream)(nil)
+)
+
+// ReceiveStream is the receiving side of a unidirectional stream.
+type ReceiveStream struct {
+	s *stream
+}
+
+// StreamID returns the stream's identifier.
+func (s *ReceiveStream) StreamID() StreamID { return s.s.id }
+
+// Read reads data from the stream. It returns io.EOF once the peer has
+// closed the stream and everything was read, a *quic.StreamError after a
+// reset or CancelRead, and os.ErrDeadlineExceeded past the read deadline.
+func (s *ReceiveStream) Read(p []byte) (int, error) { return s.s.read(p) }
+
+// Peek fills p with stream data without consuming it. It waits until
+// len(p) bytes are available, respecting the read deadline. If the stream
+// ends first, it returns the bytes there are along with io.EOF. len(p) must
+// not exceed the stream's receive window.
+func (s *ReceiveStream) Peek(p []byte) (int, error) { return s.s.peek(p) }
+
+// CancelRead abandons reading: buffered data is discarded, and the peer is
+// asked to stop sending with the given error code.
+func (s *ReceiveStream) CancelRead(code StreamErrorCode) { s.s.cancelRead(code) }
+
+// SetReadDeadline sets the deadline for Read calls, pending and future. A
+// zero value means no deadline.
+func (s *ReceiveStream) SetReadDeadline(t time.Time) error {
+	s.s.setReadDeadline(t)
+	return nil
+}
+
+// SendStream is the sending side of a unidirectional stream.
+type SendStream struct {
+	s *stream
+}
+
+// StreamID returns the stream's identifier.
+func (s *SendStream) StreamID() StreamID { return s.s.id }
+
+// Write writes data to the stream, waiting for the peer's flow control
+// while it has to. It does not retain p. It returns a *quic.StreamError
+// after CancelWrite or once the peer has stopped reading, and
+// os.ErrDeadlineExceeded past the write deadline.
+func (s *SendStream) Write(p []byte) (int, error) { return s.s.write(p) }
+
+// Close ends the stream: the peer reads io.EOF after the data written so
+// far. It is a no-op after CancelWrite.
+func (s *SendStream) Close() error { return s.s.closeSend() }
+
+// CancelWrite resets the stream with the given error code. Data the peer
+// has not read yet may be lost.
+func (s *SendStream) CancelWrite(code StreamErrorCode) { s.s.cancelWrite(code) }
+
+// Context returns a context that is cancelled when the sending side ends:
+// on Close, CancelWrite, the peer's request to stop sending, or the close
+// of the connection. The cause of a reset is its *quic.StreamError.
+func (s *SendStream) Context() context.Context { return s.s.ctx }
+
+// SetPriority sets the priority of the data written to the stream, with the
+// urgency and incremental parameters of RFC 9218. Urgency is clipped to the
+// range 0 through 7, and lower values go first. Within an urgency,
+// incremental streams take turns, and the others go in the order of their
+// stream ID. The default is urgency 3, incremental.
+//
+// Priorities decide which stream writes the next record when several wait
+// for the transport. Data already handed to the transport is not reordered.
+func (s *SendStream) SetPriority(urgency int8, incremental bool) {
+	s.s.setPriority(urgency, incremental)
+}
+
+// SetWriteDeadline sets the deadline for Write calls, pending and future.
+// A zero value means no deadline. The deadline bounds the wait for the
+// peer's flow control; a write that the transport itself holds up ends
+// with the connection's idle timeout.
 func (s *SendStream) SetWriteDeadline(t time.Time) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.send.writeDeadline = t
+	s.s.setWriteDeadline(t)
 	return nil
 }
 
 // Stream is a bidirectional stream.
 type Stream struct {
-	*baseStream
+	s *stream
 }
 
-func (s *Stream) Read(p []byte) (int, error) { return s.baseStream.read(p) }
-func (s *Stream) Write(p []byte) (int, error) { return s.baseStream.write(p) }
-func (s *Stream) Close() error { return s.baseStream.close() }
-func (s *Stream) CancelRead(code StreamErrorCode) { s.baseStream.cancelRead(code) }
-func (s *Stream) CancelWrite(code StreamErrorCode) { s.baseStream.cancelWrite(code) }
-func (s *Stream) StreamID() StreamID { return s.baseStream.id }
-func (s *Stream) Context() context.Context { return s.baseStream.ctx }
+// StreamID returns the stream's identifier.
+func (s *Stream) StreamID() StreamID { return s.s.id }
+
+// Read reads data from the stream. See ReceiveStream.Read.
+func (s *Stream) Read(p []byte) (int, error) { return s.s.read(p) }
+
+// Write writes data to the stream. See SendStream.Write.
+func (s *Stream) Write(p []byte) (int, error) { return s.s.write(p) }
+
+// Close ends the sending side of the stream. The receiving side stays
+// open: read it to the end, or call CancelRead.
+func (s *Stream) Close() error { return s.s.closeSend() }
+
+// CancelRead abandons reading. See ReceiveStream.CancelRead.
+func (s *Stream) CancelRead(code StreamErrorCode) { s.s.cancelRead(code) }
+
+// CancelWrite resets the sending side. See SendStream.CancelWrite.
+func (s *Stream) CancelWrite(code StreamErrorCode) { s.s.cancelWrite(code) }
+
+// Context returns a context that is cancelled when the sending side ends.
+// See SendStream.Context.
+func (s *Stream) Context() context.Context { return s.s.ctx }
+
+// SetPriority sets the priority of the data written to the stream. See
+// SendStream.SetPriority.
+func (s *Stream) SetPriority(urgency int8, incremental bool) {
+	s.s.setPriority(urgency, incremental)
+}
+
+// Peek fills p with stream data without consuming it. See
+// ReceiveStream.Peek.
+func (s *Stream) Peek(p []byte) (int, error) { return s.s.peek(p) }
+
+// SetDeadline sets the read and write deadlines.
 func (s *Stream) SetDeadline(t time.Time) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.receive.readDeadline = t
-	s.send.writeDeadline = t
+	s.s.setReadDeadline(t)
+	s.s.setWriteDeadline(t)
 	return nil
 }
+
+// SetReadDeadline sets the deadline for Read calls.
 func (s *Stream) SetReadDeadline(t time.Time) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.receive.readDeadline = t
+	s.s.setReadDeadline(t)
 	return nil
 }
+
+// SetWriteDeadline sets the deadline for Write calls.
 func (s *Stream) SetWriteDeadline(t time.Time) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.send.writeDeadline = t
+	s.s.setWriteDeadline(t)
 	return nil
-}
-
-// Internal methods on baseStream
-func (s *baseStream) read(p []byte) (n int, err error) {
-	s.mutex.Lock()
-	for s.receive.readBuffer.Len() == 0 && !s.receive.receiveClosed.Load() && s.receive.receiveError == nil {
-		if !s.receive.readDeadline.IsZero() && time.Now().After(s.receive.readDeadline) {
-			s.mutex.Unlock()
-			return 0, errors.New("deadline exceeded")
-		}
-
-		var timeoutChan <-chan time.Time
-		var timer *time.Timer
-		if !s.receive.readDeadline.IsZero() {
-			duration := time.Until(s.receive.readDeadline)
-			if duration <= 0 {
-				s.mutex.Unlock()
-				return 0, errors.New("deadline exceeded")
-			}
-			timer = time.NewTimer(duration)
-			timeoutChan = timer.C
-		}
-
-		s.mutex.Unlock()
-		select {
-		case <-s.receive.readChan:
-		case <-timeoutChan:
-			return 0, errors.New("deadline exceeded")
-		case <-s.ctx.Done():
-			s.mutex.Lock()
-			if s.receive.receiveError != nil {
-				err = s.receive.receiveError
-				s.mutex.Unlock()
-				return 0, err
-			}
-			s.mutex.Unlock()
-			return 0, s.ctx.Err()
-		}
-		if timer != nil {
-			timer.Stop()
-		}
-		s.mutex.Lock()
-	}
-
-	if s.receive.readBuffer.Len() > 0 {
-		n, _ = s.receive.readBuffer.Read(p)
-		s.mutex.Unlock()
-
-		// Update stream flow control
-		if update, limit := s.receive.receiveFC.AddReadBytes(uint64(n)); update {
-			s.session.queueControlFrame(&wire.MaxStreamDataFrame{
-				StreamID:          uint64(s.id),
-				MaximumStreamData: limit,
-			})
-		}
-		// Update connection flow control
-		if update, limit := s.session.connFC.AddReadBytes(uint64(n)); update {
-			s.session.queueControlFrame(&wire.MaxDataFrame{
-				MaximumData: limit,
-			})
-		}
-		return n, nil
-	}
-
-	if s.receive.receiveError != nil {
-		err = s.receive.receiveError
-	} else if s.receive.receiveClosed.Load() {
-		err = io.EOF
-	}
-	s.mutex.Unlock()
-	return n, err
-}
-
-func (s *baseStream) write(p []byte) (n int, err error) {
-	total := 0
-	for total < len(p) {
-		s.mutex.Lock()
-		if s.send.sendClosed.Load() {
-			if s.send.sendError != nil {
-				err = s.send.sendError
-			} else {
-				err = errors.New("stream closed for writing")
-			}
-			s.mutex.Unlock()
-			return total, err
-		}
-		s.mutex.Unlock()
-
-		select {
-		case <-s.ctx.Done():
-			s.mutex.Lock()
-			if s.send.sendError != nil {
-				err = s.send.sendError
-				s.mutex.Unlock()
-				return total, err
-			}
-			s.mutex.Unlock()
-			return total, s.ctx.Err()
-		default:
-		}
-
-		if !s.send.writeDeadline.IsZero() && time.Now().After(s.send.writeDeadline) {
-			return total, errors.New("deadline exceeded")
-		}
-
-		remaining := uint64(len(p) - total)
-
-		// Get wake channels BEFORE checking window to avoid race condition
-		streamWake := s.send.sendFC.WaitSendWindow()
-		connWake := s.session.connFC.WaitSendWindow()
-
-		s.mutex.Lock()
-		window := s.send.sendFC.SendWindowRemaining()
-		connWindow := s.session.connFC.SendWindowRemaining()
-		peerMaxRecord := s.session.peerMaxRecordSize.Load()
-		s.mutex.Unlock()
-
-		if window > connWindow {
-			window = connWindow
-		}
-
-		if window == 0 {
-			var timeoutChan <-chan time.Time
-			var timer *time.Timer
-			if !s.send.writeDeadline.IsZero() {
-				duration := time.Until(s.send.writeDeadline)
-				if duration <= 0 {
-					return total, errors.New("deadline exceeded")
-				}
-				timer = time.NewTimer(duration)
-				timeoutChan = timer.C
-			}
-
-			select {
-			case <-streamWake:
-			case <-connWake:
-			case <-s.send.writeChan:
-			case <-timeoutChan:
-				return total, errors.New("deadline exceeded")
-			case <-s.ctx.Done():
-				s.mutex.Lock()
-				if s.send.sendError != nil {
-					err = s.send.sendError
-					s.mutex.Unlock()
-					return total, err
-				}
-				s.mutex.Unlock()
-				return total, s.ctx.Err()
-			}
-			if timer != nil {
-				timer.Stop()
-			}
-			continue
-		}
-
-		canSend := min(remaining, window)
-
-		// Respect peerMaxRecordSize.
-		const maxOverhead = 64
-		if peerMaxRecord > maxOverhead {
-			maxPayload := peerMaxRecord - maxOverhead
-			if canSend > maxPayload {
-				canSend = maxPayload
-			}
-		}
-
-		data := p[total : total+int(canSend)]
-
-		f := wire.GetStreamFrame()
-		f.StreamID = uint64(s.id)
-		f.Offset = s.send.sendOffset.Load()
-		f.Data = data
-		f.Fin = false
-
-		if err := s.session.sendFrame(f); err != nil {
-			f.Recycle()
-			return total, err
-		}
-
-		s.send.sendFC.AddSentBytes(uint64(len(data)))
-		s.session.connFC.AddSentBytes(uint64(len(data)))
-		s.send.sendOffset.Add(uint64(len(data)))
-
-		total += len(data)
-	}
-
-	return total, nil
-}
-
-func (s *baseStream) closeWithError(err error) {
-	// Close receive side
-	if !s.receive.receiveClosed.Swap(true) {
-		s.mutex.Lock()
-		s.receive.receiveError = err
-		s.mutex.Unlock()
-		select {
-		case s.receive.readChan <- struct{}{}:
-		default:
-		}
-	}
-
-	// Close send side
-	if !s.send.sendClosed.Swap(true) {
-		s.mutex.Lock()
-		s.send.sendError = err
-		s.mutex.Unlock()
-		select {
-		case s.send.writeChan <- struct{}{}:
-		default:
-		}
-	}
-}
-
-func (s *baseStream) close() error {
-	if s.send.sendClosed.Swap(true) {
-		return nil
-	}
-	offset := s.send.sendOffset.Load()
-
-	f := wire.GetStreamFrame()
-	f.StreamID = uint64(s.id)
-	f.Offset = offset
-	f.Data = nil
-	f.Fin = true
-
-	return s.session.sendFrame(f)
-}
-
-func (s *baseStream) cancelRead(code StreamErrorCode) {
-	s.session.queueControlFrame(&wire.StopSendingFrame{
-		StreamID:  uint64(s.id),
-		ErrorCode: uint64(code),
-	})
-}
-
-func (s *baseStream) cancelWrite(code StreamErrorCode) {
-	offset := s.send.sendOffset.Load()
-
-	s.session.queueControlFrame(&wire.ResetStreamFrame{
-		StreamID:  uint64(s.id),
-		ErrorCode: uint64(code),
-		FinalSize: offset,
-	})
-}
-
-func (s *baseStream) handleStreamFrame(f *wire.StreamFrame) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	if f.Offset != s.receive.receiveOffset.Load() {
-		return &quic.TransportError{ErrorCode: ProtocolViolationError, ErrorMessage: "out of order STREAM frame"}
-	}
-
-	if !s.receive.receiveFC.AddReceivedBytes(uint64(len(f.Data))) {
-		return &quic.TransportError{ErrorCode: FlowControlError, ErrorMessage: "stream flow control violation"}
-	}
-	if !s.session.connFC.AddReceivedBytes(uint64(len(f.Data))) {
-		return &quic.TransportError{ErrorCode: FlowControlError, ErrorMessage: "connection flow control violation"}
-	}
-
-
-	s.receive.readBuffer.Write(f.Data)
-	s.receive.receiveOffset.Add(uint64(len(f.Data)))
-	if f.Fin {
-		s.receive.receiveClosed.Store(true)
-	}
-
-	select {
-	case s.receive.readChan <- struct{}{}:
-	default:
-	}
-
-	return nil
-}
-
-func (s *baseStream) handleResetStreamFrame(f *wire.ResetStreamFrame) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	if s.receive.receiveClosed.Swap(true) {
-		return
-	}
-	s.receive.receiveError = &quic.StreamError{StreamID: s.id, ErrorCode: StreamErrorCode(f.ErrorCode)}
-
-	// Unblock Read
-	select {
-	case s.receive.readChan <- struct{}{}:
-	default:
-	}
-	// Also unblock Write just in case
-	select {
-	case s.send.writeChan <- struct{}{}:
-	default:
-	}
-}
-
-func (s *baseStream) handleStopSendingFrame(f *wire.StopSendingFrame) {
-	s.mutex.Lock()
-	if s.send.sendClosed.Swap(true) {
-		s.mutex.Unlock()
-		return
-	}
-	s.send.sendError = &quic.StreamError{StreamID: s.id, ErrorCode: StreamErrorCode(f.ErrorCode)}
-	offset := s.send.sendOffset.Load()
-	s.mutex.Unlock()
-
-	// Send RESET_STREAM in response to STOP_SENDING as per RFC 9000
-	s.session.queueControlFrame(&wire.ResetStreamFrame{
-		StreamID:  uint64(s.id),
-		ErrorCode: uint64(f.ErrorCode),
-		FinalSize: offset,
-	})
-
-	// Unblock Write
-	select {
-	case s.send.writeChan <- struct{}{}:
-	default:
-	}
-	// Also unblock Read just in case
-	select {
-	case s.receive.readChan <- struct{}{}:
-	default:
-	}
 }

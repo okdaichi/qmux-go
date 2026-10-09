@@ -1,3 +1,3 @@
 # Examples
 
-Examples will be added as the project evolves.
+Runnable examples live next to the code, in `qmux/example_test.go`.

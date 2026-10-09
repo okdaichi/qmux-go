@@ -1,116 +1,61 @@
 package qmux
 
 import (
-	"bytes"
-	"context"
 	"io"
-	"net"
 	"testing"
-	"time"
 
-	"github.com/okdaichi/qmux-go/qmux/internal/wire"
-	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/stretchr/testify/require"
 )
 
-type discardByteWriter struct{}
-
-func (d discardByteWriter) Write(p []byte) (int, error) { return len(p), nil }
-func (d discardByteWriter) WriteByte(c byte) error      { return nil }
-
-func BenchmarkVarInt_Write(b *testing.B) {
-	v := uint64(0x3fffffffffffffff)
-	var buf [8]byte
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = quicvarint.Append(buf[:0], v)
-	}
-}
-
-func BenchmarkVarInt_Read(b *testing.B) {
-	data := []byte{0xc0, 0, 0, 0, 0, 0, 0, 0x35}
-	br := bytes.NewReader(data)
-	qr := quicvarint.NewReader(br)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = quicvarint.Read(qr)
-		br.Reset(data)
-	}
-}
-
-func BenchmarkRecord_Write(b *testing.B) {
-	w := wire.NewRecordWriter(discardByteWriter{})
-	f := wire.GetStreamFrame()
-	f.StreamID = 1
-	f.Data = make([]byte, 1024)
-	
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = w.WriteRecordSingle(f)
-	}
-}
-
 func BenchmarkStream_Throughput(b *testing.B) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer ln.Close()
+	client, server := newTestPair(b, nil, nil)
+	ctx := testContext(b)
 
-	serverDone := make(chan struct{})
+	done := make(chan struct{})
 	go func() {
-		conn, err := ln.Accept()
+		defer close(done)
+		s, err := server.AcceptUniStream(ctx)
 		if err != nil {
 			return
 		}
-		defer conn.Close()
-		server, err := Server(conn, nil)
-		if err != nil {
-			return
-		}
-		defer server.Close()
-		
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		
-		str, err := server.AcceptStream(ctx)
-		if err != nil {
-			return
-		}
-		io.Copy(io.Discard, str)
-		close(serverDone)
+		_, _ = io.Copy(io.Discard, s) // not actionable: the benchmark fails on the write side
 	}()
 
-	conn, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer conn.Close()
-	
-	client, err := Dial(conn, nil)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer client.Close()
-	
-	str, err := client.OpenStream()
-	if err != nil {
-		b.Fatal(err)
-	}
-
+	s, err := client.OpenUniStreamSync(ctx)
+	require.NoError(b, err)
 	data := make([]byte, 32*1024)
 	b.SetBytes(int64(len(data)))
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, err := str.Write(data)
-		if err != nil {
-			b.Fatal(err)
-		}
+	b.ReportAllocs()
+	for b.Loop() {
+		_, err := s.Write(data)
+		require.NoError(b, err)
 	}
-	str.Close()
-	
-	select {
-	case <-serverDone:
-	case <-time.After(5 * time.Second):
-		b.Fatal("server timed out")
+	require.NoError(b, s.Close())
+	<-done
+}
+
+// One small stream per message, the shape of one MoQ group per frame.
+func BenchmarkConn_StreamPerMessage(b *testing.B) {
+	client, server := newTestPair(b, nil, nil)
+	ctx := testContext(b)
+
+	go func() {
+		for {
+			s, err := server.AcceptUniStream(ctx)
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, s) // not actionable: the benchmark fails on the write side
+		}
+	}()
+
+	data := make([]byte, 160)
+	b.ReportAllocs()
+	for b.Loop() {
+		s, err := client.OpenUniStreamSync(ctx)
+		require.NoError(b, err)
+		_, err = s.Write(data)
+		require.NoError(b, err)
+		require.NoError(b, s.Close())
 	}
 }

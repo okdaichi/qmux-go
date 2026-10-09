@@ -10,58 +10,83 @@ import (
 )
 
 func Example() {
-	// Setup a simple TCP echo server using QMux
-	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	defer ln.Close()
+	// A TCP echo server speaking QMux.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer func() { _ = ln.Close() }() // not actionable: the example is over
 
 	go func() {
-		conn, _ := ln.Accept()
-		sess, _ := qmux.Server(conn, nil)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		sess, err := qmux.Server(context.Background(), conn, nil)
+		if err != nil {
+			return
+		}
 		for {
 			str, err := sess.AcceptStream(context.Background())
 			if err != nil {
 				return
 			}
-			go io.Copy(str, str) // Echo
+			go func() {
+				if _, err := io.Copy(str, str); err != nil {
+					return
+				}
+				if err := str.Close(); err != nil {
+					return
+				}
+			}()
 		}
 	}()
 
-	// Client side
-	conn, _ := net.Dial("tcp", ln.Addr().String())
-	sess, _ := qmux.Dial(conn, nil)
-	str, _ := sess.OpenStream()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	sess, err := qmux.Dial(context.Background(), conn, nil)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer func() { _ = sess.Close() }() // not actionable: the example is over
 
-	str.Write([]byte("hello qmux"))
-	buf := make([]byte, 10)
-	n, _ := str.Read(buf)
-	fmt.Println(string(buf[:n]))
+	str, err := sess.OpenStreamSync(context.Background())
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if _, err := str.Write([]byte("hello qmux")); err != nil {
+		fmt.Println(err)
+		return
+	}
+	if err := str.Close(); err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	reply, err := io.ReadAll(str)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Println(string(reply))
 
 	// Output: hello qmux
 }
 
-func ExampleConn_ConnectionStats() {
-	// Assuming you have an active session
-	var sess *qmux.Conn
-	
-	// Get real-time throughput and RTT metrics
-	stats := sess.ConnectionStats()
-	fmt.Printf("Bytes Sent: %d\n", stats.BytesSent)
-	fmt.Printf("Smoothed RTT: %v\n", stats.SmoothedRTT)
-}
+func ExampleServerMessages() {
+	// mc adapts a WebSocket connection whose negotiated subprotocol names
+	// the application protocol and the QMux draft, such as "qmux-02.myapp".
+	var mc qmux.MessageConn
 
-func ExampleNetConn() {
-	// Adapt a hypothetical message-based transport to net.Conn
-	type myMessageConn struct { /* ... */ }
-	// func (c *myMessageConn) ReadMessage() ([]byte, error) { ... }
-	// func (c *myMessageConn) WriteMessage(p []byte) error  { ... }
-	// func (c *myMessageConn) Close() error                 { ... }
-
-	var mc qmux.MessageConn // = &myMessageConn{}
-	
-	// Wrap it!
-	nc := qmux.NetConn(mc)
-	
-	// Now use it with QMux or any other net.Conn consumer
-	sess, _ := qmux.Dial(nc, nil)
-	_ = sess
+	sess, err := qmux.ServerMessages(context.Background(), mc, nil)
+	if err != nil {
+		return
+	}
+	defer sess.Close()
 }
