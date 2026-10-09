@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.3.0] - 2026-10-10
 
 The connection, stream and wire code is rewritten against **draft-ietf-quic-qmux-02**. The wire format changes, so this version does not talk to 0.2.0.
 
@@ -18,6 +18,8 @@ The connection, stream and wire code is rewritten against **draft-ietf-quic-qmux
 - Deadlines return `os.ErrDeadlineExceeded`.
 - The idle timeout is the shorter of the two endpoints' values, and closes without sending a frame.
 - CI: the workflows were in `.github/workflow/` and never ran.
+- A stream's read buffer stays within its flow control window however the application reads.
+- With `Config.KeepAlivePeriod` set, pings left unanswered for the idle timeout close the connection. Sending them reset the idle timer, so a peer that was gone kept the connection open.
 
 ### Added
 - `DialMessages` and `ServerMessages`: one record per message, without the `Size` field. This is the WebSocket mapping of `@moq/qmux`, which the implementation is tested against.
@@ -40,6 +42,7 @@ The connection, stream and wire code is rewritten against **draft-ietf-quic-qmux
 - quic-go is required at v0.63.0.
 - Zero fields of `Config` take their defaults. The default windows are 512 KiB per stream and 1 MiB per connection.
 - `Write` and `Close` write to the transport directly, so a slow peer applies backpressure instead of growing a queue.
+- `DATA_BLOCKED`, `STREAM_DATA_BLOCKED` and `STREAMS_BLOCKED` frames are accepted but no longer sent.
 
 ## [0.2.0] - 2024-04-26
 
