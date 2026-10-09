@@ -1,12 +1,10 @@
-// Package qmux implements the QMux protocol, providing QUIC-like stream and datagram operations
-// over reliable, bi-directional byte streams.
-// It follows the draft-ietf-quic-qmux-01 specification.
 package qmux
 
 import (
 	"net"
 	"time"
 
+	"github.com/okdaichi/qmux-go/qmux/internal/wire"
 	"github.com/quic-go/quic-go"
 )
 
@@ -16,61 +14,124 @@ type StreamID = quic.StreamID
 const (
 	defaultMaxIncomingStreams      = 100
 	defaultMaxIncomingUniStreams   = 100
-	defaultInitialStreamWindow     = 64 * 1024
-	defaultInitialConnectionWindow = 64 * 1024
+	defaultStreamReceiveWindow     = 512 * 1024
+	defaultConnectionReceiveWindow = 1024 * 1024
+	defaultMaxIdleTimeout          = 30 * time.Second
+	defaultMaxDatagramFrameSize    = 1200
 )
 
-// Config contains configuration for a QMux connection.
+// Config contains configuration for a QMux connection. A zero field takes
+// its default.
 type Config struct {
-	// MaxIncomingStreams is the maximum number of concurrent bidirectional streams
-	// that a peer is allowed to open.
+	// MaxIncomingStreams is the number of bidirectional streams the peer
+	// may have open at a time. The default is 100; a negative value allows
+	// none.
 	MaxIncomingStreams int64
-	// MaxIncomingUniStreams is the maximum number of concurrent unidirectional streams
-	// that a peer is allowed to open.
+	// MaxIncomingUniStreams is the number of unidirectional streams the
+	// peer may have open at a time. The default is 100; a negative value
+	// allows none.
 	MaxIncomingUniStreams int64
-	// InitialStreamReceiveWindow is the initial flow control window for each stream.
+	// InitialStreamReceiveWindow is the flow control window of each stream:
+	// the most data the peer may send ahead of what the application has
+	// read. The default is 512 KiB.
 	InitialStreamReceiveWindow uint64
-	// InitialConnectionReceiveWindow is the initial flow control window for the connection.
+	// InitialConnectionReceiveWindow is the flow control window of the
+	// connection, across all streams. The default is 1 MiB.
 	InitialConnectionReceiveWindow uint64
-	// MaxRecordSize is the maximum size of a QMux record.
+	// MaxRecordSize is the largest record the peer may send. The default,
+	// which is also the minimum, is 16382 bytes.
 	MaxRecordSize uint64
-	// KeepAlivePeriod is the interval between QX_PING frames.
+	// KeepAlivePeriod is the interval between QX_PING frames. Zero sends
+	// none.
 	KeepAlivePeriod time.Duration
-	// MaxIdleTimeout is the maximum idle time before the connection is closed.
+	// MaxIdleTimeout closes the connection when no record was sent or
+	// received for this long. The peer's own timeout applies when it is
+	// shorter. The default is 30 seconds; a negative value declares none.
 	MaxIdleTimeout time.Duration
-	// EnableDatagrams enables the unreliable datagram extension.
+	// EnableDatagrams enables the datagram extension (RFC 9221). QMux
+	// delivers datagrams reliably and in order.
 	EnableDatagrams bool
-	// MaxDatagramFrameSize is the maximum size of a DATAGRAM frame.
+	// MaxDatagramFrameSize is the largest DATAGRAM frame the peer may send
+	// when datagrams are enabled. The default is 1200 bytes.
 	MaxDatagramFrameSize uint64
-	// ApplicationProtocols is a list of supported application protocols (similar to ALPN).
-	ApplicationProtocols []string
 }
 
 // DefaultConfig returns the default configuration.
 func DefaultConfig() *Config {
-	return &Config{
-		MaxIncomingStreams:             defaultMaxIncomingStreams,
-		MaxIncomingUniStreams:          defaultMaxIncomingUniStreams,
-		InitialStreamReceiveWindow:     defaultInitialStreamWindow,
-		InitialConnectionReceiveWindow: defaultInitialConnectionWindow,
-		MaxRecordSize:                  16382,
-		MaxIdleTimeout:                 30 * time.Second,
-		MaxDatagramFrameSize:           1200,
+	c := (*Config)(nil).normalized()
+	return &c
+}
+
+// normalized returns a copy of the configuration with every default filled
+// in and every limit within what the protocol allows.
+func (c *Config) normalized() Config {
+	var n Config
+	if c != nil {
+		n = *c
 	}
+	n.MaxIncomingStreams = streamLimit(n.MaxIncomingStreams, defaultMaxIncomingStreams)
+	n.MaxIncomingUniStreams = streamLimit(n.MaxIncomingUniStreams, defaultMaxIncomingUniStreams)
+	if n.InitialStreamReceiveWindow == 0 {
+		n.InitialStreamReceiveWindow = defaultStreamReceiveWindow
+	}
+	if n.InitialConnectionReceiveWindow == 0 {
+		n.InitialConnectionReceiveWindow = defaultConnectionReceiveWindow
+	}
+	n.MaxRecordSize = max(n.MaxRecordSize, wire.DefaultMaxRecordSize)
+	if n.MaxIdleTimeout == 0 {
+		n.MaxIdleTimeout = defaultMaxIdleTimeout
+	}
+	n.MaxIdleTimeout = max(n.MaxIdleTimeout, 0)
+	if !n.EnableDatagrams {
+		n.MaxDatagramFrameSize = 0
+	} else if n.MaxDatagramFrameSize == 0 {
+		n.MaxDatagramFrameSize = defaultMaxDatagramFrameSize
+	}
+	n.MaxDatagramFrameSize = min(n.MaxDatagramFrameSize, n.MaxRecordSize)
+	return n
 }
 
-// Dial establishes a QMux connection over an existing network connection.
-// It acts as a client.
+func streamLimit(v, def int64) int64 {
+	switch {
+	case v == 0:
+		return def
+	case v < 0:
+		return 0
+	}
+	return min(v, 1<<60)
+}
+
+// Dial starts a QMux connection as the client over conn, an established
+// byte stream such as a TLS connection. It returns without waiting for the
+// peer: operations on the connection wait for the peer's transport
+// parameters as they need them. The connection owns conn from here on.
+//
+// QMux does not negotiate the application protocol. The transport must
+// have, for example with ALPN.
 func Dial(conn net.Conn, config *Config) (*Conn, error) {
-	s := newSession(conn, config, false)
-	go s.run()
-	return s, nil
+	cfg := config.normalized()
+	return newConn(newStreamTransport(conn, cfg.MaxRecordSize), cfg, false), nil
 }
 
-// Server starts a QMux connection over an existing network connection.
-// It acts as a server.
+// Server starts a QMux connection as the server over conn. See Dial.
 func Server(conn net.Conn, config *Config) (*Conn, error) {
-	s := newSession(conn, config, true)
-	go s.run()
-	return s, nil
+	cfg := config.normalized()
+	return newConn(newStreamTransport(conn, cfg.MaxRecordSize), cfg, true), nil
+}
+
+// DialMessages starts a QMux connection as the client over a message
+// transport, sending one record per message. The message boundary delimits
+// the record, so the record's Size field is not sent. This is the mapping
+// that QMux implementations use over WebSocket, where the negotiated
+// subprotocol names the application protocol and the QMux draft.
+func DialMessages(mc MessageConn, config *Config) (*Conn, error) {
+	cfg := config.normalized()
+	return newConn(&messageTransport{mc: mc, max: cfg.MaxRecordSize}, cfg, false), nil
+}
+
+// ServerMessages starts a QMux connection as the server over a message
+// transport. See DialMessages.
+func ServerMessages(mc MessageConn, config *Config) (*Conn, error) {
+	cfg := config.normalized()
+	return newConn(&messageTransport{mc: mc, max: cfg.MaxRecordSize}, cfg, true), nil
 }

@@ -1,10 +1,5 @@
 # Overview
 
-This repository is a minimal scaffold for future work related to qmux.
+`qmux-go` implements QMux: QUIC's streams, flow control and datagrams over a reliable, ordered transport such as TLS over TCP or a WebSocket.
 
-At a high level, qmux can be thought of as QUIC-like multiplexing semantics over transports such as TCP and WebSocket.
-
-For reference, see:
-- https://www.ietf.org/archive/id/draft-ietf-quic-qmux-01.html
-
-This repository intentionally does not provide a protocol implementation yet.
+It follows [draft-ietf-quic-qmux-02](https://www.ietf.org/archive/id/draft-ietf-quic-qmux-02.html). See the package documentation of `qmux` for usage.

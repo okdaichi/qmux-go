@@ -1,61 +1,58 @@
 /*
-Package qmux implements the QMux protocol, providing QUIC-like stream and datagram operations
-over reliable, bi-directional byte streams.
+Package qmux implements QMux: QUIC's streams, flow control and datagrams
+over a reliable, ordered transport such as TLS over TCP or a WebSocket. It
+follows draft-ietf-quic-qmux-02.
 
-It strictly follows the draft-ietf-quic-qmux-01 specification, enabling multiplexing
-semantics (like multiple streams and unreliable datagrams) over transports that are normally
-limited to a single stream, such as TCP, TLS, or WebSockets.
+# Usage
 
-# Architecture
-
-QMux uses a layered architecture:
-  - Transport Layer: Any reliable byte-stream (net.Conn).
-  - Record Layer: Self-delimiting chunks of data containing QMux frames.
-  - Multiplexing Layer: Manages stream IDs, flow control, and datagrams.
-
-# Basic Usage (TCP)
-
-A QMux connection starts with an existing net.Conn. You can wrap it as a server or a client:
+A connection runs over a transport that is already established. Its API
+mirrors that of a quic-go connection:
 
 	// Server
-	ln, _ := net.Listen("tcp", "localhost:8080")
 	conn, _ := ln.Accept()
 	sess, _ := qmux.Server(conn, nil)
-	stream, _ := sess.AcceptStream(context.Background())
+	stream, _ := sess.AcceptStream(ctx)
 
 	// Client
-	conn, _ := net.Dial("tcp", "localhost:8080")
+	conn, _ := tls.Dial("tcp", addr, tlsConfig)
 	sess, _ := qmux.Dial(conn, nil)
-	stream, _ := sess.OpenStream()
+	stream, _ := sess.OpenStreamSync(ctx)
 
-# WebSocket Support
+# Application protocol
 
-QMux can run over WebSockets by using the provided MessageConn adapter. This allows QMux to
-map its records directly to WebSocket messages:
+QMux does not negotiate the application protocol, and has no identifier of
+its own: the transport does it (Section 8.1 of the draft). Over TLS that is
+ALPN. Over WebSocket it is the subprotocol, which by convention also names
+the QMux draft, as in "qmux-02.myapp".
+
+# WebSocket
+
+DialMessages and ServerMessages run a connection over a MessageConn, with one
+record per message. The message boundary delimits the record, so the record's
+Size field is not sent. This is the mapping other QMux implementations use
+over WebSocket.
 
 	// With gorilla/websocket
-	type wsAdapter struct { *websocket.Conn }
-	func (a *wsAdapter) ReadMessage() ([]byte, error) { _, p, err := a.ReadMessage(); return p, err }
-	func (a *wsAdapter) WriteMessage(p []byte) error  { return a.WriteMessage(websocket.BinaryMessage, p) }
+	type wsConn struct{ *websocket.Conn }
 
-	nc := qmux.NetConn(&wsAdapter{conn})
-	sess, _ := qmux.Dial(nc, nil)
+	func (c wsConn) ReadMessage() ([]byte, error) {
+		_, p, err := c.Conn.ReadMessage()
+		return p, err
+	}
 
-# Protocol Negotiation
+	func (c wsConn) WriteMessage(p []byte) error {
+		return c.Conn.WriteMessage(websocket.BinaryMessage, p)
+	}
 
-QMux supports in-band application protocol negotiation (similar to ALPN) via Transport Parameters.
-This allows a single QMux connection to support multiple application protocols:
+	sess, _ := qmux.ServerMessages(wsConn{ws}, nil)
 
-	config := qmux.DefaultConfig()
-	config.ApplicationProtocols = []string{"moq-v1"}
-	sess, _ := qmux.Dial(conn, config)
-	
-	// Check negotiated protocol
-	proto := sess.ConnectionState().TLS.NegotiatedProtocol
+NetConn adapts a MessageConn to a net.Conn instead, for peers that treat the
+messages as a plain byte stream.
 
-# Performance
+# Differences from QUIC
 
-The implementation is optimized for high-performance and low-allocation scenarios, utilizing
-buffer pooling, atomic state management, and the quic-go/quicvarint library.
+All streams share one ordered transport: a lost segment delays every stream,
+and a datagram, once sent, is delivered reliably. Stream priorities are not
+implemented.
 */
 package qmux
