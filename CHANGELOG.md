@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- `github.com/quic-go/quic-go` is v0.65.0 (was v0.63.0).
+
 ## [0.3.0] - 2026-10-10
 
 The connection, stream and wire code is rewritten against **draft-ietf-quic-qmux-02**. The wire format changes, so this version does not talk to 0.2.0.
