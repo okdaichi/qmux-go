@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-13
+
 ### Changed
 - `github.com/quic-go/quic-go` is v0.65.0 (was v0.63.0).
 
